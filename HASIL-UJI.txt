@@ -1,0 +1,22 @@
+HAURA 3.0 — HASIL UJI LOKAL
+
+28 tes backend lulus. Hash PBKDF2-SHA256 600.000 iterasi dibandingkan
+Node crypto termasuk Unicode; tanpa penggantian algoritma tiruan.
+Layanan Drive/Properties/Lock/HtmlService menggunakan simulator lokal.
+
+Integrasi Chromium lulus pada subpath /haura/:
+- Login admin melalui formulir iframe Google, bukan field password Pages.
+- Admin menambah program, peserta daftar pending, admin mengaktifkan.
+- Peserta mengikuti program gratis dan mengirim chat sampai tampil.
+- Admin reset, password sementara, wajib ganti, dan sesi baru berjalan.
+- Tampilan ponsel 390 px; tidak ada overflow horizontal/error JS tak tertangani.
+
+Belum diuji produksi: Google iframe live, deployment akun pemilik,
+semua perangkat/browser, uji beban, audit penetrasi, migrasi data lama,
+serta semua kombinasi unggah foto/sertifikat/PDF.
+
+Tidak ada Firebase SDK/config, service account, atau endpoint Firebase.
+Email hanya identitas lokal; tidak diverifikasi otomatis. Aktivasi manual.
+Database/password hash/sesi tidak boleh dimasukkan repository publik.
+
+Jalankan checklist PANDUAN bagian 16 setelah deployment nyata.

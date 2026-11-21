@@ -1,0 +1,25 @@
+HAURA INSTITUTE 3.0 — BUKAN VERSI FIREBASE
+
+1. Buat repository GitHub PUBLIC, contoh haura-institute.
+2. Buat proyek Google Apps Script; salin SELURUH apps-script/Code.gs.
+3. Isi 3 Script Properties:
+   SITE_ORIGIN = https://USERNAME_ANDA.github.io (tanpa nama repo/slash)
+   ADMIN_EMAIL = email login admin Anda
+   ADMIN_PASSWORD = password Haura pilihan Anda, minimal 10 karakter
+4. Jalankan siapkanHaura_ dari editor; beri izin. Folder/db/admin dibuat
+   otomatis. ADMIN_PASSWORD dihapus setelah persiapan berhasil.
+5. Deploy Web App: Me + Anyone. Salin URL /exec.
+6. Isi satu URL tersebut pada js/drive-config.js.
+7. Upload ISI folder ini (bukan ZIP/folder pembungkus) ke root repository.
+8. Settings > Pages > Deploy from a branch > main > / (root) > Save.
+9. Buka alamat Pages HTTPS; login dengan admin yang dibuat di langkah 3.
+10. Peserta daftar; admin Aktifkan Akun. Tidak ada verifikasi email.
+
+Buka PANDUAN.pdf atau PANDUAN.html untuk penjelasan tiap kolom/menu.
+Tidak perlu Firebase, Supabase, API key, service account, atau terminal.
+Folder database harus Restricted. Jangan upload database/backup/password
+ke repository. Repo Pages gratis adalah PUBLIC, bukan tempat data privat.
+
+Versi GitHub ini NONTRANSAKSI: pembayaran/QRIS tidak aktif sesuai batas
+penggunaan Pages. Jangan gunakan untuk rekam medis/data pasien sensitif.
+Sesi hilang saat refresh; login ulang normal. Lihat HASIL-UJI.txt.
