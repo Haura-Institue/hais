@@ -24,7 +24,8 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden&&watchers.
 function subscribe(c,filters,ok,fail,id){const w={c,filters,ok,fail,id,last:Symbol()};watchers.add(w);if(bridge.configured)queueMicrotask(()=>sync().catch(()=>{}));return()=>watchers.delete(w);}
 export const watch=(c,filters,ok,fail)=>subscribe(c,filters,ok,fail);
 export async function read(c,id){const result=await bridge.call('read',{c,id});return revive(result);}
-async function mutate(ops){const result=await bridge.call('mutate',{ops});if(inFlight)await inFlight.catch(()=>{});await sync().catch(()=>{});return result;}
+async function runAndSync(action,args){const result=await bridge.call(action,args);if(inFlight)await inFlight.catch(()=>{});await sync().catch(()=>{});return result;}
+async function mutate(ops){return runAndSync('mutate',{ops});}
 export const create=(c,id,data)=>mutate([{op:'set',c,id,data}]);
 export const patch=(c,id,data)=>mutate([{op:'patch',c,id,data}]);
 export const remove=(c,id)=>mutate([{op:'remove',c,id}]);
@@ -39,9 +40,9 @@ export const F={
   async reload(){await bridge.call('identity');},
   writeBatch:()=>{const ops=[];return {update:(ref,data)=>ops.push({op:'patch',...ref,data}),commit:()=>mutate(ops)};}
 };
-export function validateFile(file,allowed=['image/jpeg','image/png','image/webp'],max=5*1024*1024){if(!file||!allowed.includes(file.type))throw new Error('Format berkas tidak didukung.');if(!file.size||file.size>Math.min(max,5*1024*1024))throw new Error('Ukuran berkas harus 1 byte sampai 5 MB untuk penghubung Drive.');}
+export function validateFile(file,allowed=['image/jpeg','image/png','image/webp'],max=5*1024*1024){if(!file||!allowed.includes(file.type))throw new Error('Format berkas tidak didukung (gunakan JPG/PNG/WebP).');if(!file.size||file.size>Math.min(max,5*1024*1024))throw new Error('Ukuran berkas harus 1 byte sampai 5 MB.');}
 export async function upload(path,file,allowed,max){requireStorage();validateFile(file,allowed,max);const base64=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result).split(',')[1]);r.onerror=reject;r.readAsDataURL(file);});await bridge.call('fileWrite',{path,mime:file.type,base64});return path;}
-export const publicFileURL=()=>''; // Gunakan fileURL async; tidak ada tautan Drive privat yang dipublikasikan.
+export const publicFileURL=()=>'';
 export async function fileURL(path){
   if(blobs.has(path))return blobs.get(path);if(pendingFiles.has(path))return pendingFiles.get(path);
   const generation=fileEpoch;
@@ -65,4 +66,9 @@ export function accountFrame(mode='login'){
   return '<iframe title="Akun Haura di Google Apps Script" referrerpolicy="no-referrer" src="'+src+'" style="width:100%;height:560px;border:0;background:white"></iframe>';
 }
 export async function resetMember(uid){return bridge.call('authReset',{uid});}
-export async function enroll(programId){const result=await bridge.call('freeEnroll',{programId});if(inFlight)await inFlight.catch(()=>{});await sync();return result;}
+export async function paidEnroll(payload){return runAndSync('paidEnroll',payload);}
+export async function submitPayment(payload){return runAndSync('submitPayment',payload);}
+export async function confirmPayment(payload){return runAndSync('confirmPayment',payload);}
+export async function saveEvaluation(payload){return runAndSync('saveEvaluation',payload);}
+export async function addExpense(payload){return runAndSync('addExpense',payload);}
+export async function removeExpense(expenseId){return runAndSync('removeExpense',{expenseId});}
