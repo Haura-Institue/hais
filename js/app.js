@@ -90,7 +90,7 @@ function tabsRender(){
 }
 function dashboard(){
   if(!me)return loginForm();$('#landing-view').hidden=true;$('#portal-view').hidden=false;
-  $('#portal-heading').innerHTML=`<span class="eyebrow green">${admin?'PUSAT KENDALI ADMIN':'PORTAL PESERTA'}</span><h2>Selamat datang, ${esc(profile?.name||me.email)}</h2><p class="muted">${admin?'Kelola pelatihan, pembayaran, evaluasi, dan rekap kas.':'Ruang belajar, pembayaran pelatihan, dan hasil evaluasi Anda.'}</p>`;
+  $('#portal-heading').innerHTML=`<span class="eyebrow green">${admin?'PUSAT KENDALI ADMIN':'PORTAL PESERTA'}</span><h2>Selamat datang, ${esc(profile?.name||me.email)}</h2><p class="muted">${admin?'Kelola pelatihan, pembayaran, evaluasi, dan rekap kas.':'Mari tumbuh dan menjadi ahli bersama kami.'}</p>`;
   if(!profile){$('#tabs').innerHTML='';$('#portal-content').innerHTML=profileForm();return;}
   if(!admin&&(profile.status!=='approved')){
     $('#tabs').innerHTML='';$('#portal-content').innerHTML=`<h2>Status Pendaftaran Akun</h2><p>${status(profile.status)}</p><p class="muted">Email hanya identitas login; tidak perlu verifikasi email. Persetujuan akun dilakukan oleh admin sebelum Anda dapat mendaftar program pelatihan.</p><button class="button" data-action="refresh-auth">Periksa Status</button> <button class="button" data-action="upload-profile">Perbarui Pas Foto</button>`;return;
