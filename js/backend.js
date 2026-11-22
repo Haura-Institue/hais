@@ -1,8 +1,28 @@
 import {driveConfig} from './drive-config.js';
 import {createBridge,revive,selectRows} from './drive-client.js';
 export const configured=/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(driveConfig.webAppUrl||'');
-const auth={currentUser:null};let sessionToken='';const authObservers=new Set();
-let cache={}, cacheUID=null, epoch=0, fileEpoch=0, inFlight=null;
+
+const SESSION_KEY='haura_tab_session_v3';
+function readSavedSession(){
+  try{
+    const raw=sessionStorage.getItem(SESSION_KEY);
+    if(!raw)return null;
+    const parsed=JSON.parse(raw);
+    return (parsed?.token&&parsed?.user?.uid)?parsed:null;
+  }catch{return null;}
+}
+function writeSavedSession(data){
+  try{
+    if(data?.token&&data?.user?.uid)sessionStorage.setItem(SESSION_KEY,JSON.stringify({token:data.token,user:data.user}));
+    else sessionStorage.removeItem(SESSION_KEY);
+  }catch{}
+}
+
+const initialSession=readSavedSession();
+let sessionToken=initialSession?.token||'';
+const auth={currentUser:initialSession?{...initialSession.user,getIdToken:async()=>sessionToken}:null};
+const authObservers=new Set();
+let cache={}, cacheUID=auth.currentUser?.uid||null, epoch=0, fileEpoch=0, inFlight=null;
 const bridge=createBridge(driveConfig,()=>auth?.currentUser), watchers=new Set(), blobs=new Map(), pendingFiles=new Map();
 export const storageConfigured=bridge.configured;
 export const requireStorage=()=>{if(!storageConfigured)throw new Error('Isi js/drive-config.js dan pasang Apps Script sesuai PANDUAN.html.');};
@@ -34,7 +54,15 @@ export const F={
   where:(field,op,value)=>{if(op!=='==')throw new Error('Filter tidak didukung.');return {type:'where',field,value};},
   orderBy:(field,direction)=>({type:'orderBy',field,direction}),limit:count=>({type:'limit',count}),
   doc:(_db,c,id)=>({c,id}),onSnapshot:(ref,ok,fail)=>subscribe(ref.c,[],ok,fail,ref.id),
-  async getIdTokenResult(){const identity=await bridge.call('identity');return {claims:{admin:identity.admin}};},
+  async getIdTokenResult(){
+    try{
+      const identity=await bridge.call('identity');
+      return {claims:{admin:identity.admin}};
+    }catch(e){
+      if(/^Sesi|^Wajib mengganti/.test(e.message)&&auth.currentUser)setSession(null);
+      throw e;
+    }
+  },
   onAuthStateChanged:(_a,cb)=>{authObservers.add(cb);queueMicrotask(()=>cb(auth.currentUser));return()=>authObservers.delete(cb);},
   async signOut(){try{if(auth.currentUser)await bridge.call('authLogout');}finally{setSession(null);}},
   async reload(){await bridge.call('identity');},
@@ -53,7 +81,15 @@ export async function removeFile(path){await bridge.call('fileRemove',{path});if
 export function clearFiles(){fileEpoch++;for(const url of blobs.values())URL.revokeObjectURL(url);blobs.clear();pendingFiles.clear();}
 export function errorMessage(e){return e?.message||'Operasi gagal. Periksa koneksi dan konfigurasi Apps Script.';}
 
-function setSession(data){sessionToken=data?.token||'';auth.currentUser=data?{...data.user,getIdToken:async()=>sessionToken}:null;epoch++;cache={};cacheUID=auth.currentUser?.uid||'';inFlight=null;clearFiles();for(const w of watchers)w.last=Symbol();for(const cb of authObservers)cb(auth.currentUser);if(configured)queueMicrotask(()=>sync().catch(()=>{}));}
+function setSession(data){
+  writeSavedSession(data);
+  sessionToken=data?.token||'';
+  auth.currentUser=data?{...data.user,getIdToken:async()=>sessionToken}:null;
+  epoch++;cache={};cacheUID=auth.currentUser?.uid||'';inFlight=null;clearFiles();
+  for(const w of watchers)w.last=Symbol();
+  for(const cb of authObservers)cb(auth.currentUser);
+  if(configured)queueMicrotask(()=>sync().catch(()=>{}));
+}
 export function accountFrame(mode='login'){
   requireStorage();const channel=crypto.randomUUID();let target,origin;
   const handler=event=>{const d=event.data;if(!d||d.channel!==channel||(!/^https:\/\/(?:[a-z0-9-]+\.)?googleusercontent\.com$/.test(event.origin)&&event.origin!=='https://script.google.com'))return;
