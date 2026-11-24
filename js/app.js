@@ -147,7 +147,7 @@ async function handleSession(user){
       if(epoch!==session)return;const old=profile;profile=snap.exists()?{id:snap.id,...snap.data()}:null;
       if(profile?.status!=='approved'&&!admin){subscriptions.forEach(s=>s());subscriptions=[];chatStop?.();chatStop=null;B.clearFiles();}
       navRender();
-      if(!old||old.status!==profile?.status||old.chatAccess!==profile?.chatAccess){startPrivate();if(!registering){tab=admin?'finance':'catalog';dashboard();}}
+      if(!old||old.status!==profile?.status||old.chatAccess!==profile?.chatAccess||old.photoPath!==profile?.photoPath){startPrivate();if(!registering){tab=admin?'finance':'catalog';dashboard();}}
     },fail);
     profile=await B.read('users',user.uid);if(epoch!==session)return;
     startPrivate();tab=admin?'finance':'catalog';navRender();if(!registering)dashboard();
