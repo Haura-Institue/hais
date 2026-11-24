@@ -25,7 +25,7 @@ const authObservers=new Set();
 let cache={}, cacheUID=auth.currentUser?.uid||null, epoch=0, fileEpoch=0, inFlight=null;
 const bridge=createBridge(driveConfig,()=>auth?.currentUser), watchers=new Set(), blobs=new Map(), pendingFiles=new Map();
 export const storageConfigured=bridge.configured;
-export const requireStorage=()=>{if(!storageConfigured)throw new Error('Isi js/drive-config.js dan pasang Apps Script sesuai PANDUAN.html.');};
+export const requireStorage=()=>{if(!storageConfigured)throw new Error('Konfigurasi webAppUrl di js/drive-config.js belum diisi.');};
 export async function init(){return configured;}
 export const authInstance=()=>auth;
 export const dbInstance=()=>null;
@@ -68,18 +68,27 @@ export const F={
   async reload(){await bridge.call('identity');},
   writeBatch:()=>{const ops=[];return {update:(ref,data)=>ops.push({op:'patch',...ref,data}),commit:()=>mutate(ops)};}
 };
-export function validateFile(file,allowed=['image/jpeg','image/png','image/webp'],max=5*1024*1024){if(!file||!allowed.includes(file.type))throw new Error('Format berkas tidak didukung (gunakan JPG/PNG/WebP).');if(!file.size||file.size>Math.min(max,5*1024*1024))throw new Error('Ukuran berkas harus 1 byte sampai 5 MB.');}
+export function validateFile(file,allowed=['image/jpeg','image/png','image/webp'],max=5*1024*1024){if(!file||!allowed.includes(file.type))throw new Error('Format berkas tidak didukung.');if(!file.size||file.size>Math.min(max,5*1024*1024))throw new Error('Ukuran berkas maksimal 5 MB.');}
 export async function upload(path,file,allowed,max){requireStorage();validateFile(file,allowed,max);const base64=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result).split(',')[1]);r.onerror=reject;r.readAsDataURL(file);});await bridge.call('fileWrite',{path,mime:file.type,base64});return path;}
 export const publicFileURL=()=>'';
 export async function fileURL(path){
   if(blobs.has(path))return blobs.get(path);if(pendingFiles.has(path))return pendingFiles.get(path);
   const generation=fileEpoch;
-  const task=(async()=>{const data=await bridge.call('fileRead',{path});if(fileEpoch!==generation)throw new Error('Sesi berubah. Buka ulang berkas.');const bytes=Uint8Array.from(atob(data.base64),c=>c.charCodeAt(0));const url=URL.createObjectURL(new Blob([bytes],{type:data.mime}));blobs.set(path,url);return url;})();
+  const task=(async()=>{const data=await bridge.call('fileRead',{path});if(fileEpoch!==generation)throw new Error('Sesi berubah.');const bytes=Uint8Array.from(atob(data.base64),c=>c.charCodeAt(0));const url=URL.createObjectURL(new Blob([bytes],{type:data.mime}));blobs.set(path,url);return url;})();
   pendingFiles.set(path,task);try{return await task;}finally{if(pendingFiles.get(path)===task)pendingFiles.delete(path);}
+}
+export async function readHtmlFile(path){
+  const data=await bridge.call('fileRead',{path});
+  if(data?.html!==undefined)return data.html;
+  if(data?.base64){
+    const bytes=Uint8Array.from(atob(data.base64),c=>c.charCodeAt(0));
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+  throw new Error('Konten buku digital tidak ditemukan.');
 }
 export async function removeFile(path){await bridge.call('fileRemove',{path});if(blobs.has(path))URL.revokeObjectURL(blobs.get(path));blobs.delete(path);}
 export function clearFiles(){fileEpoch++;for(const url of blobs.values())URL.revokeObjectURL(url);blobs.clear();pendingFiles.clear();}
-export function errorMessage(e){return e?.message||'Operasi gagal. Periksa koneksi dan konfigurasi Apps Script.';}
+export function errorMessage(e){return e?.message||'Operasi gagal. Periksa koneksi internet.';}
 
 function setSession(data){
   writeSavedSession(data);
@@ -99,12 +108,16 @@ export function accountFrame(mode='login'){
   };
   window.addEventListener('message',handler);setTimeout(()=>window.removeEventListener('message',handler),20*60*1000);
   const src=driveConfig.webAppUrl+'?view=account&mode='+encodeURIComponent(mode)+'&channel='+channel+'&parentOrigin='+encodeURIComponent(location.origin);
-  return '<iframe title="Akun Haura di Google Apps Script" referrerpolicy="no-referrer" src="'+src+'" style="width:100%;height:560px;border:0;background:white"></iframe>';
+  return '<iframe title="Akun Haura" referrerpolicy="no-referrer" src="'+src+'" style="width:100%;height:540px;border:0;background:white"></iframe>';
 }
 export async function resetMember(uid){return bridge.call('authReset',{uid});}
 export async function paidEnroll(payload){return runAndSync('paidEnroll',payload);}
 export async function submitPayment(payload){return runAndSync('submitPayment',payload);}
 export async function confirmPayment(payload){return runAndSync('confirmPayment',payload);}
 export async function saveEvaluation(payload){return runAndSync('saveEvaluation',payload);}
+export async function subscribeChat(payload){return runAndSync('subscribeChat',payload);}
+export async function reviewChatPayment(payload){return runAndSync('reviewChatPayment',payload);}
+export async function orderAlkes(payload){return runAndSync('orderAlkes',payload);}
+export async function reviewAlkesOrder(payload){return runAndSync('reviewAlkesOrder',payload);}
 export async function addExpense(payload){return runAndSync('addExpense',payload);}
 export async function removeExpense(expenseId){return runAndSync('removeExpense',{expenseId});}
