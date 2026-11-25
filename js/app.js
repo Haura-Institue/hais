@@ -13,8 +13,264 @@ let valFilterBatch='ALL';
 let alkesCart={}, bajuCart={};
 let activeReaderBookId='';
 let verifyHandled=false;
+let offlineBookIds=new Set();
 let state={cms:{logoText:'HAURA',logoPath:'',welcomeTitle:'Tumbuh bersama. Merawat lebih baik.',welcomeText:'Pelatihan keperawatan, buku digital, konsultasi klinis, dan pendampingan praktik mandiri dalam satu portal.',chatFee:50000,chatDurationLabel:'30 Hari',videoUrl:'',videoPath:'',qrisPath:'',paymentInfo:'',certIndex:{}},programs:[],news:[],users:[],enrollments:[],chatPayments:[],alkes:[],alkesOrders:[],ebooks:[],certificates:[],expenses:[],messages:[]};
 let certImages={main:'./assets/logo.png',partner:'',left:'',right:''};
+
+const isOffline = () => !navigator.onLine;
+const isOfflineSession = () => Boolean(me?.offline || isOffline());
+
+/* ============================================================================
+   ANTI-FREEZE / SMART RENDER SCHEDULER (CEGAH JEDA SAAT MENGETIK & BACA BUKU)
+   ============================================================================ */
+let lastUserInputAt = 0;
+let pendingRefresh = false;
+let refreshDebounceTimer = null;
+let publicDebounceTimer = null;
+const renderHashes = {};
+
+function markUserActivity(){ lastUserInputAt = Date.now(); }
+
+function isUserBusy(){
+  const reader = $('#ebook-reader');
+  if(reader && reader.style.display === 'flex') return true;
+  if($('#modal')?.open) return true;
+  if(Date.now() - lastUserInputAt < 2500) return true;
+  const active = document.activeElement;
+  const portal = $('#portal-content');
+  if(active && portal && portal.contains(active) && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return true;
+  if(portal && portal.querySelector('details[open]')) return true;
+  return false;
+}
+
+function shouldRender(key, payload, force=false){
+  const sig = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  if(!force && renderHashes[key] === sig) return false;
+  renderHashes[key] = sig;
+  return true;
+}
+
+function resetRenderHashes(){
+  for(const k of Object.keys(renderHashes)) delete renderHashes[k];
+}
+
+function schedulePublicRender(){
+  clearTimeout(publicDebounceTimer);
+  publicDebounceTimer = setTimeout(() => {
+    if($('#ebook-reader')?.style.display === 'flex') return;
+    publicRender();
+  }, 300);
+}
+
+function scheduleRefreshSection(){
+  clearTimeout(refreshDebounceTimer);
+  refreshDebounceTimer = setTimeout(() => {
+    if(isUserBusy()){
+      pendingRefresh = true;
+      return;
+    }
+    pendingRefresh = false;
+    refreshSection(false);
+  }, 350);
+}
+
+setInterval(() => {
+  if(pendingRefresh && !isUserBusy()){
+    pendingRefresh = false;
+    refreshSection(false);
+  }
+}, 1500);
+
+/* ============================================================================
+   PENYIMPANAN OFFLINE (INDEXEDDB UNTUK BUKU DIGITAL & LOCALSTORAGE UNTUK LOGIN)
+   ============================================================================ */
+const OFFLINE_ACCOUNTS_KEY = 'haura_offline_accounts_v1';
+const OFFLINE_ACTIVE_KEY = 'haura_offline_active_uid_v1';
+const OFFLINE_DB_NAME = 'haura_offline_books_db';
+const OFFLINE_DB_VER = 1;
+let offlineDbPromise = null;
+let cachingQueueRunning = false;
+
+function openOfflineDB(){
+  if(offlineDbPromise) return offlineDbPromise;
+  offlineDbPromise = new Promise((resolve, reject) => {
+    if(!('indexedDB' in window)) return reject(new Error('IndexedDB tidak didukung.'));
+    const req = indexedDB.open(OFFLINE_DB_NAME, OFFLINE_DB_VER);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if(!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', {keyPath: 'userId'});
+      if(!db.objectStoreNames.contains('html')) db.createObjectStore('html', {keyPath: 'id'});
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return offlineDbPromise;
+}
+
+async function idbPut(storeName, value){
+  const db = await openOfflineDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbGet(storeName, key){
+  const db = await openOfflineDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGetAllKeys(storeName){
+  const db = await openOfflineDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAllKeys();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function refreshOfflineBookIndex(){
+  try{
+    const keys = await idbGetAllKeys('html');
+    offlineBookIds = new Set(keys.map(String));
+  }catch{}
+}
+
+async function saveOfflineEbookHtml(book, htmlContent){
+  if(!book?.id || !htmlContent) return;
+  try{
+    await idbPut('html', {
+      id: String(book.id),
+      htmlPath: book.htmlPath || '',
+      title: book.title || '',
+      html: String(htmlContent),
+      savedAt: Date.now()
+    });
+    offlineBookIds.add(String(book.id));
+  }catch(e){ console.warn('Gagal menyimpan cache buku offline:', e); }
+}
+
+async function getOfflineEbookHtml(bookId){
+  try{
+    const rec = await idbGet('html', String(bookId));
+    return rec?.html || '';
+  }catch{ return ''; }
+}
+
+async function syncOfflineEbooks(userId, books){
+  if(!userId || isOffline()) return;
+  try{
+    await idbPut('meta', {userId: String(userId), ebooks: books, updatedAt: Date.now()});
+    await refreshOfflineBookIndex();
+  }catch{}
+  if(cachingQueueRunning || !B?.configured) return;
+  cachingQueueRunning = true;
+  try{
+    for(const b of books){
+      if(isOffline() || !me || me.uid !== userId) break;
+      if(b.kind !== 'html' || !b.htmlPath) continue;
+      const existing = await idbGet('html', String(b.id));
+      if(existing && existing.htmlPath === b.htmlPath && existing.html) continue;
+      while(isUserBusy() && !isOffline()){
+        await new Promise(r => setTimeout(r, 1500));
+      }
+      if(isOffline()) break;
+      try{
+        const html = await B.readHtmlFile(b.htmlPath);
+        if(html) await saveOfflineEbookHtml(b, html);
+      }catch{}
+      await new Promise(r => setTimeout(r, 900));
+    }
+    if(tab === 'modules') scheduleRefreshSection();
+  }finally{
+    cachingQueueRunning = false;
+  }
+}
+
+async function loadOfflineEbooks(userId){
+  await refreshOfflineBookIndex();
+  try{
+    const rec = await idbGet('meta', String(userId));
+    return Array.isArray(rec?.ebooks) ? rec.ebooks : [];
+  }catch{ return []; }
+}
+
+async function sha256Hex(text){
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+const OfflineAuth = {
+  all(){
+    try{ return JSON.parse(localStorage.getItem(OFFLINE_ACCOUNTS_KEY) || '{}'); }catch{ return {}; }
+  },
+  writeAll(map){
+    try{ localStorage.setItem(OFFLINE_ACCOUNTS_KEY, JSON.stringify(map)); }catch{}
+  },
+  saveSession({uid: userId, email, profile: prof, admin: isAdm}){
+    if(!userId || !prof) return;
+    if(!isAdm && prof.status !== 'approved') return;
+    const map = this.all();
+    const prev = map[userId] || {};
+    const normEmail = String(email || prof.email || prev.email || '').trim().toLowerCase();
+    map[userId] = {
+      uid: userId,
+      email: normEmail,
+      admin: Boolean(isAdm),
+      profile: {...prof},
+      passHash: prev.passHash || '',
+      passSalt: prev.passSalt || '',
+      savedAt: Date.now()
+    };
+    this.writeAll(map);
+    try{ localStorage.setItem(OFFLINE_ACTIVE_KEY, userId); }catch{}
+  },
+  async setOfflinePassword(userId, plainPassword){
+    const map = this.all();
+    const rec = map[userId];
+    if(!rec) throw new Error('Sesi akun belum tersimpan di perangkat.');
+    const salt = uid();
+    const passHash = await sha256Hex(`${salt}:${plainPassword}`);
+    rec.passSalt = salt;
+    rec.passHash = passHash;
+    map[userId] = rec;
+    this.writeAll(map);
+  },
+  clearActive(){
+    try{ localStorage.removeItem(OFFLINE_ACTIVE_KEY); }catch{}
+  },
+  getActiveAccount(){
+    try{
+      const activeId = localStorage.getItem(OFFLINE_ACTIVE_KEY);
+      if(!activeId) return null;
+      return this.all()[activeId] || null;
+    }catch{ return null; }
+  },
+  listAccounts(){
+    return Object.values(this.all()).filter(a => a && (a.admin || a.profile?.status === 'approved'));
+  },
+  async verifyLogin(identifier, password=''){
+    const clean = String(identifier || '').trim().toLowerCase();
+    const accounts = this.listAccounts();
+    const acc = accounts.find(a => a.email === clean || a.uid === clean) || (accounts.length === 1 && !clean ? accounts[0] : null);
+    if(!acc) throw new Error('Akun tidak ditemukan di penyimpanan offline perangkat ini. Silakan masuk saat online terlebih dahulu.');
+    if(acc.passHash){
+      if(!password) throw new Error('Masukkan Password Offline akun Anda.');
+      const check = await sha256Hex(`${acc.passSalt}:${password}`);
+      if(check !== acc.passHash) throw new Error('Password Offline salah.');
+    }
+    try{ localStorage.setItem(OFFLINE_ACTIVE_KEY, acc.uid); }catch{}
+    return acc;
+  }
+};
 
 function toast(message){ $('#toast').textContent=message; $('#toast').hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('#toast').hidden=true,5000); }
 function fail(error){ console.error(error); toast(B?.errorMessage(error)||error.message||'Terjadi kesalahan.'); }
@@ -24,7 +280,7 @@ function field(label,name,type='text',value='',extra=''){return `<div class="fie
 function area(label,name,value='',extra=''){return `<div class="field"><label for="${esc(name)}">${label}</label><textarea id="${esc(name)}" name="${esc(name)}" ${extra}>${esc(value)}</textarea></div>`;}
 const submit = (text='Simpan',klass='') => `<button class="button ${klass}" type="submit">${text}</button>`;
 const empty = text => `<p class="empty">${text}</p>`;
-const img = (path,klass='avatar',alt='Foto') => `<img src="./assets/logo.png" ${path?`data-file="${esc(path)}"`:''} class="${klass}" alt="${esc(alt)}" loading="lazy">`;
+const img = (path,klass='avatar',alt='Foto') => `<img src="./assets/logo.png" ${path&&!isOffline()?`data-file="${esc(path)}"`:''} class="${klass}" alt="${esc(alt)}" loading="lazy">`;
 const status = value => `<span class="status ${esc(value)}">${({pending:'Menunggu validasi',approved:'Aktif',rejected:'Nonaktif'})[value]||esc(value)}</span>`;
 
 function safeURL(v){ try{const u=new URL(v);return u.protocol==='https:'?u.href:'';}catch{return '';}}
@@ -42,13 +298,34 @@ function youtubeEmbedURL(v){
   return /^[A-Za-z0-9_-]{11}$/.test(id)?`https://www.youtube-nocookie.com/embed/${id}?rel=0`:'';
 }
 
-function ready(){if(!B?.configured)throw new Error('Konfigurasi server belum diisi.');if(!navigator.onLine)throw new Error('Periksa koneksi internet Anda.');}
-function member(){ready();if(!me||!profile)throw new Error('Silakan masuk terlebih dahulu.');if(!admin&&(profile.status!=='approved'))throw new Error('Akun menunggu aktivasi admin.');}
+function ready(){
+  if(isOffline()) throw new Error('Mode offline aktif. Fitur ini memerlukan koneksi internet (hanya Login & Buku Digital yang tersedia offline).');
+  if(!B?.configured) throw new Error('Konfigurasi server belum diisi.');
+}
+function member(){
+  ready();
+  if(!me||!profile) throw new Error('Silakan masuk terlebih dahulu.');
+  if(!admin&&(profile.status!=='approved')) throw new Error('Akun menunggu aktivasi admin.');
+}
+function memberBooksAccess(){
+  if(!me||!profile) throw new Error('Silakan masuk terlebih dahulu.');
+  if(!admin&&(profile.status!=='approved')) throw new Error('Akun menunggu aktivasi admin.');
+}
 function adminOnly(){member();if(!admin)throw new Error('Akses khusus admin.');}
 
 async function hydrate(){
-  if(!B?.configured)return;
-  document.querySelectorAll('[data-file]').forEach(async el=>{const path=el.dataset.file; el.removeAttribute('data-file');try{const u=await B.fileURL(path); if(el.isConnected) el.src=u;}catch(e){if(el.isConnected){el.title=B.errorMessage(e);}}});
+  if(!B?.configured || isOffline()) return;
+  if($('#ebook-reader')?.style.display === 'flex') return;
+  document.querySelectorAll('[data-file]').forEach(async el=>{
+    const path=el.dataset.file;
+    el.removeAttribute('data-file');
+    try{
+      const u=await B.fileURL(path);
+      if(el.isConnected) el.src=u;
+    }catch(e){
+      if(el.isConnected) el.title=B.errorMessage(e);
+    }
+  });
 }
 
 /* ============================================================================
@@ -188,7 +465,7 @@ function certVerifyURL(serial){
    PENGECEKAN ORISINALITAS SERTIFIKAT (SCAN QR / BARCODE PUBLIK)
    ============================================================================ */
 function checkPublicVerification(){
-  if(verifyHandled)return;
+  if(verifyHandled || isOffline())return;
   const params=new URLSearchParams(location.search);
   const serial=(params.get('verify')||'').trim();
   if(!serial)return;
@@ -227,7 +504,7 @@ function applyBrandLogos(){
   const logoPath=state.cms.logoPath||'';
   const headerLogo=$('#header-logo');
   const heroLogo=$('#hero-logo');
-  if(logoPath && B?.storageConfigured){
+  if(logoPath && B?.storageConfigured && !isOffline()){
     B.fileURL(logoPath).then(u=>{
       if(state.cms.logoPath!==logoPath)return;
       if(headerLogo)headerLogo.src=u;
@@ -244,13 +521,23 @@ function applyBrandLogos(){
 function showLanding(){ $('#landing-view').hidden=false; $('#portal-view').hidden=true; }
 
 function publicRender(){
+  const offline = isOffline();
+  const paidPrograms=state.programs.filter(p=>(!p.kind||p.kind==='training')&&HauraFinance.programFee(p)>0);
+  const sig = JSON.stringify({
+    offline,
+    cms: {t:state.cms.logoText,l:state.cms.logoPath,wt:state.cms.welcomeTitle,wx:state.cms.welcomeText,vu:state.cms.videoUrl,vp:state.cms.videoPath},
+    programs: paidPrograms.map(p=>[p.id,p.title,p.description,p.totalFee,p.minDownPayment]),
+    news: state.news.map(n=>[n.id,n.title,n.content,n.createdAt])
+  });
+  if(!shouldRender('public', sig)) return;
+
   $('#brand-text').textContent=state.cms.logoText||'HAURA';
   applyBrandLogos();
   if(B?.configured){$('#hero-title').textContent=state.cms.welcomeTitle;$('#hero-description').textContent=state.cms.welcomeText;}
 
   const video=$('#hero-video'), iframe=$('#hero-iframe'), logo=$('#hero-logo');
-  const drivePath=state.cms.videoPath||'';
-  const rawUrl=drivePath ? '' : safeURL(state.cms.videoUrl);
+  const drivePath=!offline ? (state.cms.videoPath||'') : '';
+  const rawUrl=(!offline && !drivePath) ? safeURL(state.cms.videoUrl) : '';
   const ytUrl=rawUrl ? youtubeEmbedURL(rawUrl) : '';
   const directUrl=(rawUrl && !ytUrl) ? rawUrl : '';
 
@@ -261,7 +548,7 @@ function publicRender(){
       if(video.getAttribute('src')!==u)video.src=u;
       video.hidden=false;
       logo.hidden=true;
-    }).catch(fail);
+    }).catch(()=>{});
   }else if(ytUrl && iframe){
     video.pause();video.removeAttribute('src');video.hidden=true;
     if(iframe.getAttribute('src')!==ytUrl)iframe.src=ytUrl;
@@ -278,93 +565,174 @@ function publicRender(){
     logo.hidden=false;
   }
 
-  const paidPrograms=state.programs.filter(p=>(!p.kind||p.kind==='training')&&HauraFinance.programFee(p)>0);
-  $('#public-programs').innerHTML=paidPrograms.length ? paidPrograms.map(p=>{
-    const fee=HauraFinance.programFee(p), minDp=HauraFinance.programMinDp(p);
-    return `<details><summary>${esc(p.title)} · <b>${money(fee)}</b></summary><p>${esc(p.description)}</p><div class="row spread" style="align-items:center;gap:8px;flex-wrap:wrap"><span class="price">Biaya: <b>${money(fee)}</b> · Min. Daftar: <b>${money(minDp)}</b></span><button class="button small" data-action="enroll" data-id="${esc(p.id)}">Daftar Pelatihan</button></div></details>`;
-  }).join(''):empty('Belum ada program tersedia.');
-  $('#public-news').innerHTML=state.news.length?state.news.map(n=>`<details><summary>${esc(n.title)}</summary><p>${esc(n.content)}</p><small class="muted">${date(n.createdAt)}</small></details>`).join(''):empty('Belum ada informasi terbaru.');
+  $('#public-programs').innerHTML=offline
+    ? empty('Mode offline aktif. Silakan klik "Masuk Portal" untuk membaca Buku Digital yang sudah tersimpan di perangkat Anda.')
+    : (paidPrograms.length ? paidPrograms.map(p=>{
+        const fee=HauraFinance.programFee(p), minDp=HauraFinance.programMinDp(p);
+        return `<details><summary>${esc(p.title)} · <b>${money(fee)}</b></summary><p>${esc(p.description)}</p><div class="row spread" style="align-items:center;gap:8px;flex-wrap:wrap"><span class="price">Biaya: <b>${money(fee)}</b> · Min. Daftar: <b>${money(minDp)}</b></span><button class="button small" data-action="enroll" data-id="${esc(p.id)}">Daftar Pelatihan</button></div></details>`;
+      }).join(''):empty('Belum ada program tersedia.'));
+
+  $('#public-news').innerHTML=offline
+    ? empty('Berita & pengumuman memerlukan koneksi internet.')
+    : (state.news.length?state.news.map(n=>`<details><summary>${esc(n.title)}</summary><p>${esc(n.content)}</p><small class="muted">${date(n.createdAt)}</small></details>`).join(''):empty('Belum ada informasi terbaru.'));
 }
 
 function navRender(){
-  $('#auth-nav').innerHTML=me?`<span class="muted" style="color:#d2e2e8">${esc(profile?.fullTitleName||profile?.name||me.email)}</span><button class="button light compact" data-action="dashboard">Dashboard</button><button class="button ghost compact" data-action="edit-biodata">Biodata</button><button class="button ghost compact" data-action="id-card">ID Card</button><button class="button ghost compact" data-action="change-password">Password</button><button class="button ghost compact" data-action="logout">Keluar</button>`:'<button class="button ghost compact" data-action="login">Masuk Portal</button><button class="button light compact" data-action="register">Pendaftaran</button>';
+  const offline = isOffline();
+  if(!me){
+    $('#auth-nav').innerHTML = offline
+      ? '<button class="button light compact" data-action="login">Masuk Offline (Buku)</button>'
+      : '<button class="button ghost compact" data-action="login">Masuk Portal</button><button class="button light compact" data-action="register">Pendaftaran</button>';
+    return;
+  }
+  const displayName = esc(profile?.fullTitleName||profile?.name||me.email);
+  if(offline){
+    $('#auth-nav').innerHTML = `
+      <span class="muted" style="color:#fcd34d">● Mode Offline · ${displayName}</span>
+      <button class="button light compact" data-action="dashboard">Buku Digital</button>
+      <button class="button ghost compact" data-action="logout">Keluar</button>
+    `;
+    return;
+  }
+  $('#auth-nav').innerHTML=`
+    <span class="muted" style="color:#d2e2e8">${displayName}</span>
+    <button class="button light compact" data-action="dashboard">Dashboard</button>
+    <button class="button ghost compact" data-action="edit-biodata">Biodata</button>
+    <button class="button ghost compact" data-action="id-card">ID Card</button>
+    <button class="button ghost compact" data-action="offline-pass">Sandi Offline</button>
+    <button class="button ghost compact" data-action="change-password">Password</button>
+    <button class="button ghost compact" data-action="logout">Keluar</button>
+  `;
 }
 
 const memberTabs=[['catalog','Program & Evaluasi'],['modules','Buku Digital'],['pmk','Praktik Mandiri (PMK)'],['baju','PO Baju Kesehatan'],['certificates','Sertifikat'],['chat','Diskusi & Alkes']];
 const adminTabs=[['finance','Keuangan & Evaluasi'],['validation','Peserta & Angkatan'],['cms','CMS Web'],['modules-admin','Buku & Fisik'],['pmk-admin','Bimbingan PMK'],['baju-admin','PO Baju Kesehatan'],['cert-admin','Sertifikat & Cetak'],['chat-admin','Diskusi SBAR']];
 
-function tabsRender(){
+function tabsRender(force=false){
+  const offline = isOffline();
   const pendingUsers=state.users.filter(u=>u.status==='pending').length;
   let pendingFinance=0;
   for(const e of state.enrollments)for(const p of (e.payments||[]))if(p.status==='pending')pendingFinance++;
   for(const cp of state.chatPayments)if(cp.status==='pending')pendingFinance++;
   for(const ord of state.alkesOrders)if(ord.status==='pending')pendingFinance++;
 
-  $('#tabs').innerHTML=(admin?adminTabs:memberTabs).map(([id,label])=>{
+  const list = offline ? [['modules','Buku Digital (Offline)']] : (admin?adminTabs:memberTabs);
+  const sig = JSON.stringify({offline, admin, tab, pendingUsers, pendingFinance});
+  if(!shouldRender('tabs', sig, force)) return;
+
+  $('#tabs').innerHTML=list.map(([id,label])=>{
     let badge='';
-    if(id==='validation'&&pendingUsers)badge=`<span class="badge">${pendingUsers}</span>`;
-    if(id==='finance'&&pendingFinance)badge=`<span class="badge">${pendingFinance}</span>`;
+    if(!offline && id==='validation'&&pendingUsers)badge=`<span class="badge">${pendingUsers}</span>`;
+    if(!offline && id==='finance'&&pendingFinance)badge=`<span class="badge">${pendingFinance}</span>`;
     return `<button data-action="tab" data-id="${id}" aria-selected="${tab===id}">${label}${badge}</button>`;
   }).join('');
 }
 
 function dashboard(){
-  if(!me)return loginForm();$('#landing-view').hidden=true;$('#portal-view').hidden=false;
+  if(!me) return loginForm();
+  const offline = isOffline();
+  if(offline) tab = 'modules';
+  resetRenderHashes();
+  $('#landing-view').hidden=true;
+  $('#portal-view').hidden=false;
   const displayName=profile?.fullTitleName||profile?.name||me.email;
   $('#portal-heading').innerHTML=`<div class="row spread" style="align-items:center;gap:14px;margin-bottom:8px;flex-wrap:wrap">
     <div class="row" style="align-items:center;gap:14px">
       ${img(profile?.photoPath,'avatar','Foto '+esc(displayName))}
       <div>
-        <span class="eyebrow green">${admin?'PUSAT KENDALI ADMIN':'PORTAL PESERTA'}</span>
+        <span class="eyebrow green">${offline?'MODE OFFLINE · BUKU DIGITAL':(admin?'PUSAT KENDALI ADMIN':'PORTAL PESERTA')}</span>
         <h2 style="margin:2px 0">${esc(displayName)}</h2>
         <p class="muted" style="margin:0">${profile?.institution?esc(profile.institution):''}${profile?.batch?` · <b>${esc(profile.batch)}</b>`:''}</p>
       </div>
     </div>
-    <div class="row" style="gap:8px;flex-wrap:wrap">
-      <button type="button" class="button small" data-action="edit-biodata">Lengkapi / Edit Biodata</button>
-      <button type="button" class="button small green" data-action="id-card">Cetak ID Card</button>
-    </div>
+    ${offline ? `
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <span class="pill" style="background:#fef3c7;color:#92400e">Offline: Hanya Buku Digital yang Aktif</span>
+      </div>
+    ` : `
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <button type="button" class="button small" data-action="edit-biodata">Lengkapi / Edit Biodata</button>
+        <button type="button" class="button small green" data-action="id-card">Cetak ID Card</button>
+      </div>
+    `}
   </div>`;
   hydrate();
   if(!profile){$('#tabs').innerHTML='';$('#portal-content').innerHTML='<p>Profil tidak ditemukan.</p>';return;}
   if(!admin&&(profile.status!=='approved')){
     $('#tabs').innerHTML='';$('#portal-content').innerHTML=`<h2>Status Akun</h2><p>${status(profile.status)}</p><p class="muted">Akun Anda sedang dalam proses aktivasi admin. Silakan lengkapi biodata dan pas foto Anda.</p><div class="row" style="gap:8px;flex-wrap:wrap"><button class="button" data-action="refresh-auth">Periksa Status</button><button class="button green" data-action="edit-biodata">Lengkapi Biodata & Foto</button></div>`;return;
   }
-  tabsRender();renderTab(true);
+  tabsRender(true);
+  renderTab(true);
 }
 
 function renderTab(fresh=false){
   if($('#portal-view').hidden||!profile)return;
-  if(tab==='catalog')renderCatalog();
-  if(tab==='finance'&&admin)renderFinanceAdmin();
-  if(tab==='validation')renderValidation();
-  if(tab==='modules')renderMemberModules();
-  if(tab==='pmk')renderMemberPMK();
-  if(tab==='baju')renderMemberBaju();
-  if(tab==='certificates')renderMemberCertificates();
+  if(isOffline() && tab !== 'modules'){
+    tab = 'modules';
+    tabsRender(true);
+  }
+  if(tab==='catalog')renderCatalog(fresh);
+  if(tab==='finance'&&admin)renderFinanceAdmin(fresh);
+  if(tab==='validation')renderValidation(fresh);
+  if(tab==='modules')renderMemberModules(fresh);
+  if(tab==='pmk')renderMemberPMK(fresh);
+  if(tab==='baju')renderMemberBaju(fresh);
+  if(tab==='certificates')renderMemberCertificates(fresh);
   if(tab==='cms'&&fresh)renderCMS();
   if(tab==='modules-admin'&&fresh)renderModuleAdmin();
-  if(tab==='pmk-admin'&&fresh)renderPMKAdmin();
-  if(tab==='baju-admin'&&fresh)renderBajuAdmin();
+  if(tab==='pmk-admin')renderPMKAdmin(fresh);
+  if(tab==='baju-admin')renderBajuAdmin(fresh);
   if(tab==='cert-admin'&&fresh)renderCertificateEditor();
-  if(tab==='chat')renderMemberChatAndAlkes();
-  if(tab==='chat-admin'&&fresh)renderAdminChat();
+  if(tab==='chat')renderMemberChatAndAlkes(fresh);
+  if(tab==='chat-admin')renderAdminChat(fresh);
   hydrate();
 }
 
-function refreshSection(){
+function refreshSection(force=false){
   if(!me||!profile||(!admin&&(profile.status!=='approved')))return;
-  if(admin)tabsRender();
-  if(['catalog','finance','validation','modules','pmk','baju','certificates','chat'].includes(tab))renderTab();
-  if(tab==='pmk-admin')renderPMKAdmin();
-  if(tab==='baju-admin')renderBajuAdmin();
-  if(tab==='chat-admin')renderChatUsers();
+  if(isOffline()){
+    if(tab !== 'modules'){ tab = 'modules'; tabsRender(true); }
+    renderMemberModules(force);
+    return;
+  }
+  if(admin) tabsRender(force);
+  if(['catalog','finance','validation','modules','pmk','baju','certificates','chat'].includes(tab)) renderTab(force);
+  if(tab==='pmk-admin') renderPMKAdmin(force);
+  if(tab==='baju-admin') renderBajuAdmin(force);
+  if(tab==='chat-admin') renderChatUsers(force);
 }
 
-function stopPrivate(){ $('#portal-content').innerHTML=''; $('#portal-heading').innerHTML=''; $('#tabs').innerHTML=''; subscriptions.forEach(s=>s());subscriptions=[];ownStop?.();ownStop=null;chatStop?.();chatStop=null;state.users=[];state.enrollments=[];state.chatPayments=[];state.alkesOrders=[];state.ebooks=[];state.certificates=[];state.expenses=[];state.messages=[];targetChat='';alkesCart={};bajuCart={};B?.clearFiles();applyBrandLogos(); }
-function listen(c,filters,key,extra){subscriptions.push(B.watch(c,filters,rows=>{state[key]=rows;extra?.();refreshSection();},fail));}
+function stopPrivate(){
+  $('#portal-content').innerHTML='';
+  $('#portal-heading').innerHTML='';
+  $('#tabs').innerHTML='';
+  resetRenderHashes();
+  subscriptions.forEach(s=>s());subscriptions=[];
+  ownStop?.();ownStop=null;
+  chatStop?.();chatStop=null;
+  state.users=[];state.enrollments=[];state.chatPayments=[];state.alkesOrders=[];state.ebooks=[];state.certificates=[];state.expenses=[];state.messages=[];
+  targetChat='';alkesCart={};bajuCart={};
+  B?.clearFiles();
+  applyBrandLogos();
+}
+function listen(c,filters,key,extra){
+  subscriptions.push(B.watch(c,filters,rows=>{
+    state[key]=rows;
+    extra?.(rows);
+    scheduleRefreshSection();
+  },fail));
+}
 function startPrivate(){
   subscriptions.forEach(s=>s());subscriptions=[];
+  if(isOffline()){
+    if(me?.uid){
+      loadOfflineEbooks(me.uid).then(rows=>{
+        state.ebooks = rows;
+        refreshSection(true);
+      });
+    }
+    return;
+  }
   if(!profile||(!admin&&(profile.status!=='approved')))return;
   const own=[B.F.where('userId','==',me.uid)];
   if(admin){
@@ -375,32 +743,135 @@ function startPrivate(){
   listen('chatPayments',admin?[]:own,'chatPayments');
   listen('alkesOrders',admin?[]:own,'alkesOrders');
   listen('certificates',admin?[]:own,'certificates');
-  if(admin)listen('ebooks',[],'ebooks');
-  else {
+  if(admin){
+    listen('ebooks',[],'ebooks', rows => syncOfflineEbooks(me.uid, rows));
+  } else {
     let all=[], mine=[];
-    subscriptions.push(B.watch('ebooks',[B.F.where('userId','==','all')],rows=>{all=rows;state.ebooks=[...all,...mine];refreshSection();},fail));
-    subscriptions.push(B.watch('ebooks',own,rows=>{mine=rows;state.ebooks=[...all,...mine];refreshSection();},fail));
+    subscriptions.push(B.watch('ebooks',[B.F.where('userId','==','all')],rows=>{
+      all=rows;
+      state.ebooks=[...all,...mine];
+      syncOfflineEbooks(me.uid, state.ebooks);
+      scheduleRefreshSection();
+    },fail));
+    subscriptions.push(B.watch('ebooks',own,rows=>{
+      mine=rows;
+      state.ebooks=[...all,...mine];
+      syncOfflineEbooks(me.uid, state.ebooks);
+      scheduleRefreshSection();
+    },fail));
   }
 }
 
+async function enterOfflineSession(savedAccount){
+  stopPrivate();
+  me = {uid: savedAccount.uid, email: savedAccount.email, offline: true};
+  profile = savedAccount.profile;
+  admin = Boolean(savedAccount.admin);
+  tab = 'modules';
+  navRender();
+  state.ebooks = await loadOfflineEbooks(savedAccount.uid);
+  dashboard();
+}
+
 async function handleSession(user){
-  const epoch=++session; stopPrivate();me=user;profile=null;admin=false;navRender();
+  const epoch=++session;
+  if(!user && isOffline()){
+    const saved = OfflineAuth.getActiveAccount();
+    if(saved){
+      await enterOfflineSession(saved);
+      return;
+    }
+  }
+  stopPrivate();me=user;profile=null;admin=false;navRender();
   if(!user){showLanding();return;}
+  if(isOffline()){
+    const saved = OfflineAuth.all()[user.uid];
+    if(saved){
+      await enterOfflineSession(saved);
+      return;
+    }
+  }
   try{
     const token=await B.F.getIdTokenResult(user);if(epoch!==session)return;admin=token.claims.admin===true;
     ownStop=B.F.onSnapshot(B.F.doc(B.dbInstance(),'users',user.uid),snap=>{
       if(epoch!==session)return;const old=profile;profile=snap.exists()?{id:snap.id,...snap.data()}:null;
+      if(profile) OfflineAuth.saveSession({uid:user.uid, email:user.email, profile, admin});
       if(profile?.status!=='approved'&&!admin){subscriptions.forEach(s=>s());subscriptions=[];chatStop?.();chatStop=null;B.clearFiles();}
       navRender();
-      if(!old||old.status!==profile?.status||old.chatAccess!==profile?.chatAccess||old.photoPath!==profile?.photoPath||old.fullTitleName!==profile?.fullTitleName||old.batch!==profile?.batch){startPrivate();if(!registering){tab=admin?'finance':'catalog';dashboard();}}
+      if(!old||old.status!==profile?.status||old.chatAccess!==profile?.chatAccess||old.photoPath!==profile?.photoPath||old.fullTitleName!==profile?.fullTitleName||old.batch!==profile?.batch){
+        startPrivate();
+        if(!registering){
+          tab = isOffline() ? 'modules' : (admin?'finance':'catalog');
+          dashboard();
+        }
+      }
     },fail);
     profile=await B.read('users',user.uid);if(epoch!==session)return;
-    startPrivate();tab=admin?'finance':'catalog';navRender();if(!registering)dashboard();
+    if(profile) OfflineAuth.saveSession({uid:user.uid, email:user.email, profile, admin});
+    startPrivate();
+    tab = isOffline() ? 'modules' : (admin?'finance':'catalog');
+    navRender();
+    if(!registering)dashboard();
   }catch(e){fail(e);}
 }
 
-function loginForm(){ready();modal('Masuk Portal',B.accountFrame('login'));}
-function registerForm(){ready();modal('Pendaftaran Peserta',B.accountFrame('register'));}
+function offlineLoginForm(){
+  const accounts = OfflineAuth.listAccounts();
+  if(!accounts.length){
+    modal('Login Offline Belum Tersedia',`
+      <div style="background:#fffbeb;border:1px solid #fde68a;padding:14px;border-radius:10px;color:#78350f">
+        <b>Belum ada akun tersimpan di perangkat ini.</b>
+        <p style="margin:8px 0 0;font-size:14px">Untuk keamanan, silakan masuk (login) satu kali saat perangkat terhubung ke internet agar akun dan buku digital Anda tersimpan otomatis untuk akses offline.</p>
+      </div>
+    `);
+    return;
+  }
+  const hasPassword = accounts.some(a => Boolean(a.passHash));
+  const defaultEmail = accounts[0]?.email || '';
+  const accountOptions = accounts.map(a => `<option value="${esc(a.email)}">${esc(a.profile?.fullTitleName||a.profile?.name||a.email)} (${esc(a.email)})</option>`).join('');
+  modal('Masuk Portal (Mode Offline)',`
+    <div style="background:#f0fdf4;border:1px solid #bbf7d0;padding:12px;border-radius:10px;margin-bottom:14px;font-size:13.5px;color:#166534">
+      <b>Mode Offline Aktif:</b> Anda dapat masuk menggunakan akun yang sudah tersimpan di perangkat ini untuk membaca <b>Buku Digital</b>. Fitur lain tetap terkunci sampai internet terhubung.
+    </div>
+    <form data-form="offline-login">
+      ${accounts.length > 1
+        ? `<div class="field"><label for="offline-acc-select">Pilih Akun Tersimpan</label><select id="offline-acc-select" name="email">${accountOptions}</select></div>`
+        : field('Email Akun Terdaftar','email','email',defaultEmail,'required autocomplete="username"')
+      }
+      ${hasPassword
+        ? field('Password Offline','offlinePassword','password','','placeholder="Masukkan Password Offline"')
+        : '<p class="muted" style="font-size:13px;margin:0 0 12px">Perangkat terverifikasi. Klik tombol di bawah untuk langsung membuka Buku Digital offline.</p>'
+      }
+      ${submit('Masuk & Buka Buku Digital Offline','green')}
+    </form>
+  `);
+}
+
+function openOfflinePasswordModal(){
+  ready();
+  if(!me || !profile) throw new Error('Silakan masuk terlebih dahulu.');
+  const rec = OfflineAuth.all()[me.uid];
+  modal('Atur Password Login Offline',`
+    <p style="font-size:14px">Password ini digunakan saat Anda masuk ke portal dalam keadaan <b>offline (tanpa internet)</b> untuk membaca Buku Digital di perangkat ini.</p>
+    ${rec?.passHash ? '<p style="color:#087b4b;font-size:13px"><b>✓ Password Offline sudah aktif pada perangkat ini.</b></p>' : ''}
+    <form data-form="set-offline-password">
+      ${field('Password Offline Baru (minimal 4 karakter)','newOfflinePass','password','','required minlength="4" maxlength="64"')}
+      ${field('Ulangi Password Offline','confirmOfflinePass','password','','required minlength="4" maxlength="64"')}
+      ${submit('Simpan Password Offline','green')}
+    </form>
+  `);
+}
+
+function loginForm(){
+  if(isOffline()) return offlineLoginForm();
+  ready();
+  modal('Masuk Portal',B.accountFrame('login'));
+}
+function registerForm(){
+  if(isOffline()) throw new Error('Pendaftaran peserta baru memerlukan koneksi internet.');
+  ready();
+  modal('Pendaftaran Peserta',B.accountFrame('register'));
+}
 
 /* ============================================================================
    BIODATA LENGKAP & CETAK ID CARD PESERTA
@@ -497,14 +968,15 @@ function openIdCardModal(targetUid=null){
 }
 
 /* ============================================================================
-   1. PESERTA: PROGRAM PELATIHAN BERBAYAR, PELUNASAN & EVALUASI
+1. PESERTA: PROGRAM PELATIHAN BERBAYAR, PELUNASAN & EVALUASI
    ============================================================================ */
-function renderCatalog(){
+function renderCatalog(force=false){
   const myEnr=state.enrollments.filter(enr=>{
     const prog=state.programs.find(p=>p.id===enr.programId);
     return (!prog?.kind || prog.kind==='training') && enr.kind!=='pmk';
   });
   const availablePrograms=state.programs.filter(p=>(!p.kind||p.kind==='training')&&HauraFinance.programFee(p)>0);
+  if(!shouldRender('catalog', {myEnr, availablePrograms}, force)) return;
 
   const myEnrHtml=myEnr.length ? myEnr.map(enr=>{
     const prog=state.programs.find(p=>p.id===enr.programId);
@@ -568,20 +1040,32 @@ function renderCatalog(){
 }
 
 /* ============================================================================
-   2. BUKU DIGITAL HTML FULLSCREEN & PEMESANAN BUKU FISIK (PESERTA & ADMIN)
+2. BUKU DIGITAL HTML FULLSCREEN & PEMESANAN BUKU FISIK (PESERTA & ADMIN)
    ============================================================================ */
-function renderMemberModules(){
+function renderMemberModules(force=false){
   const root=$('#portal-content');
+  const offline = isOffline();
+  const cachedIds = [...offlineBookIds];
+  if(!shouldRender('modules', {offline, cachedIds, ebooks: state.ebooks, alkesOrders: offline ? [] : state.alkesOrders}, force)) return;
+
   const html=state.ebooks.length ? state.ebooks.map(b=>{
-    const hasPhysical=Number(b.physicalPrice||0)>0 && b.physicalAlkesId;
-    return `<article class="card">
-      <h3>${esc(b.title)}</h3>
+    const isCached = offlineBookIds.has(String(b.id));
+    const hasPhysical = !offline && Number(b.physicalPrice||0)>0 && b.physicalAlkesId;
+    const canOpenOffline = !offline || isCached;
+    return `<article class="card" style="${isCached?'border-left:4px solid #087b4b':''}">
+      <div class="row spread" style="gap:6px;align-items:start;flex-wrap:wrap">
+        <h3 style="margin:0">${esc(b.title)}</h3>
+        ${b.kind==='html'
+          ? `<span class="pill" style="font-size:11px;background:${isCached?'#dcfce7':'#f1f5f9'};color:${isCached?'#166534':'#475569'}">${isCached?'✓ Tersedia Offline':'Online'}</span>`
+          : ''
+        }
+      </div>
       ${b.description?`<p style="font-size:13px">${esc(b.description)}</p>`:''}
       ${hasPhysical?`<p style="font-size:13px;color:#087b4b">Edisi Buku Fisik (Cetak): <b>${money(b.physicalPrice)}</b></p>`:''}
       <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px">
         ${b.kind==='html' && b.htmlPath
-          ? `<button class="button green" data-action="read-ebook" data-id="${esc(b.id)}">Baca Buku Digital (Layar Penuh)</button>`
-          : (safeURL(b.url)?`<a class="button" href="${esc(safeURL(b.url))}" target="_blank" rel="noopener noreferrer">Buka Materi ↗</a>`:'')
+          ? `<button class="button green" data-action="read-ebook" data-id="${esc(b.id)}" ${canOpenOffline?'':'disabled'}>${canOpenOffline?'Baca Buku Digital (Layar Penuh)':'Belum Diunduh (Perlu Internet)'}</button>`
+          : (!offline && safeURL(b.url)?`<a class="button" href="${esc(safeURL(b.url))}" target="_blank" rel="noopener noreferrer">Buka Materi ↗</a>`:'<span class="muted" style="font-size:13px">Tautan eksternal memerlukan internet.</span>')
         }
         ${hasPhysical
           ? `<button class="button gold" data-action="order-physical-book" data-id="${esc(b.id)}">Pesan Buku Fisik</button>`
@@ -589,7 +1073,18 @@ function renderMemberModules(){
         }
       </div>
     </article>`;
-  }).join('') : empty('Belum ada buku digital.');
+  }).join('') : empty(offline ? 'Belum ada buku digital yang tersimpan offline di perangkat ini.' : 'Belum ada buku digital.');
+
+  if(offline){
+    root.innerHTML=`
+      <div style="background:#fffbeb;border:1px solid #fde68a;padding:12px 14px;border-radius:10px;margin-bottom:16px;color:#78350f;font-size:13.5px">
+        <b>Mode Baca Offline Aktif:</b> Anda dapat membaca buku digital yang bertanda <b>✓ Tersedia Offline</b> tanpa koneksi internet. Pemesanan buku fisik dan fitur portal lainnya otomatis terkunci hingga internet aktif kembali.
+      </div>
+      <h2>Buku Digital (Mode Offline)</h2>
+      <div class="cards">${html}</div>
+    `;
+    return;
+  }
 
   const bookOrders=state.alkesOrders.filter(o=>(o.items||[]).some(i=>String(i.name||'').startsWith('[Buku Fisik]')));
   const ordersHtml=bookOrders.length ? bookOrders.map(o=>`
@@ -609,6 +1104,7 @@ function renderMemberModules(){
 }
 
 function openOrderPhysicalBookModal(ebookId){
+  ready();
   const b=state.ebooks.find(x=>x.id===ebookId);
   if(!b||!b.physicalAlkesId||Number(b.physicalPrice||0)<=0)throw new Error('Buku fisik belum tersedia untuk judul ini.');
   modal('Pesan Buku Fisik (Edisi Cetak)',`
@@ -629,7 +1125,7 @@ function openEbookReader(book){
   $('#ebook-reader-title').textContent=book.title||'Buku Digital';
   const orderBtn=$('#ebook-order-physical-btn');
   if(orderBtn){
-    orderBtn.hidden=!(Number(book.physicalPrice||0)>0 && book.physicalAlkesId);
+    orderBtn.hidden=isOffline() || !(Number(book.physicalPrice||0)>0 && book.physicalAlkesId);
   }
   const frame=$('#ebook-reader-frame');
   frame.srcdoc=book._htmlContent||'';
@@ -648,6 +1144,10 @@ function closeEbookReader(){
   $('#ebook-reader-frame').srcdoc='';
   overlay.style.display='none';
   document.body.style.overflow='';
+  if(pendingRefresh){
+    pendingRefresh = false;
+    refreshSection(false);
+  }
 }
 
 function renderModuleAdmin(){
@@ -679,7 +1179,7 @@ function renderModuleAdmin(){
 }
 
 /* ============================================================================
-   3. BIMBINGAN PENGAJUAN PRAKTIK MANDIRI KEPERAWATAN (PMK)
+3. BIMBINGAN PENGAJUAN PRAKTIK MANDIRI KEPERAWATAN (PMK)
    ============================================================================ */
 const PMK_STEPS=[
   {key:'str',label:'1. STR Keperawatan Aktif (Seumur Hidup / Berlaku)'},
@@ -689,12 +1189,13 @@ const PMK_STEPS=[
   {key:'sipp',label:'5. Pengajuan Izin SIPP (Dinas Kesehatan / OSS)'}
 ];
 
-function renderMemberPMK(){
+function renderMemberPMK(force=false){
   const pmkPrograms=state.programs.filter(p=>p.kind==='pmk'&&HauraFinance.programFee(p)>0);
   const myPmk=state.enrollments.filter(enr=>{
     const prog=state.programs.find(p=>p.id===enr.programId);
     return prog?.kind==='pmk' || enr.kind==='pmk';
   });
+  if(!shouldRender('pmk', {pmkPrograms, myPmk}, force)) return;
 
   const myPmkHtml=myPmk.length ? myPmk.map(enr=>{
     const prog=state.programs.find(p=>p.id===enr.programId);
@@ -776,12 +1277,13 @@ function openPmkDocsModal(enrollmentId){
   `);
 }
 
-function renderPMKAdmin(){
+function renderPMKAdmin(force=false){
   const pmkPrograms=state.programs.filter(p=>p.kind==='pmk');
   const pmkEnrs=state.enrollments.filter(enr=>{
     const prog=state.programs.find(p=>p.id===enr.programId);
     return prog?.kind==='pmk' || enr.kind==='pmk';
   });
+  if(!shouldRender('pmk-admin', {pmkPrograms, pmkEnrs, users: state.users.map(u=>[u.id,u.name,u.fullTitleName,u.phone])}, force)) return;
 
   $('#portal-content').innerHTML=`
     <h2>Bimbingan Pengajuan Praktik Mandiri Keperawatan</h2>
@@ -851,10 +1353,13 @@ function openReviewPmkModal(enrollmentId){
 }
 
 /* ============================================================================
-   4. MENU PO BAJU KESEHATAN (PESERTA & ADMIN)
+4. MENU PO BAJU KESEHATAN (PESERTA & ADMIN)
    ============================================================================ */
-function renderMemberBaju(){
+function renderMemberBaju(force=false){
   const bajuList=state.alkes.filter(a=>a.kind==='baju');
+  const myBajuOrders=state.alkesOrders.filter(o=>(o.items||[]).some(i=>String(i.name||'').startsWith('[PO Baju]')));
+  if(!shouldRender('baju', {bajuList, bajuCart, myBajuOrders}, force)) return;
+
   const itemsHtml=bajuList.length ? bajuList.map(item=>{
     const qty=Number(bajuCart[item.id]||0);
     return `<article class="card">
@@ -883,7 +1388,6 @@ function renderMemberBaju(){
     }
   }
 
-  const myBajuOrders=state.alkesOrders.filter(o=>(o.items||[]).some(i=>String(i.name||'').startsWith('[PO Baju]')));
   const ordersHtml=myBajuOrders.length ? myBajuOrders.map(o=>`
     <div style="padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin-top:8px;background:#f8fafc">
       <div class="row spread"><b>Total: ${money(o.totalAmount)}</b><span class="status ${o.status==='confirmed'?'approved':o.status==='rejected'?'rejected':'pending'}">${o.status==='confirmed'?'Dikonfirmasi / Produksi PO':o.status==='rejected'?'Ditolak':'Menunggu Verifikasi'}</span></div>
@@ -916,9 +1420,10 @@ function renderMemberBaju(){
   `;
 }
 
-function renderBajuAdmin(){
+function renderBajuAdmin(force=false){
   const bajuList=state.alkes.filter(a=>a.kind==='baju');
   const bajuOrders=state.alkesOrders.filter(o=>(o.items||[]).some(i=>String(i.name||'').startsWith('[PO Baju]')));
+  if(!shouldRender('baju-admin', {bajuList, bajuOrders, users: state.users.map(u=>[u.id,u.name,u.fullTitleName])}, force)) return;
 
   $('#portal-content').innerHTML=`
     <h2>Kelola PO Baju Kesehatan</h2>
@@ -965,9 +1470,10 @@ function renderBajuAdmin(){
 }
 
 /* ============================================================================
-   5. SERTIFIKAT PESERTA & GENERATOR + CETAK MASSAL / PER ANGKATAN (ADMIN)
+5. SERTIFIKAT PESERTA & GENERATOR + CETAK MASSAL / PER ANGKATAN (ADMIN)
    ============================================================================ */
-function renderMemberCertificates(){
+function renderMemberCertificates(force=false){
+  if(!shouldRender('certificates', state.certificates, force)) return;
   const root=$('#portal-content');
   const html=state.certificates.length ? state.certificates.map(c=>{
     if(c.locked){
@@ -1151,7 +1657,7 @@ async function captureCertificate(){const {html2canvas}=await import('../vendor/
 async function pdfDownload(source,title){const {jsPDF}=await import('../vendor/pdf.js');const pdf=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});pdf.addImage(source,'JPEG',0,0,297,210);pdf.save(`${title.replace(/[^a-z0-9_-]/gi,'_').slice(0,90)}.pdf`);}
 
 /* ============================================================================
-   6. KOTAK PEMBAYARAN QRIS & MODAL PEMBAYARAN PROGRAM
+6. KOTAK PEMBAYARAN QRIS & MODAL PEMBAYARAN PROGRAM
    ============================================================================ */
 function paymentInstructionBox(){
   const qris=state.cms.qrisPath;
@@ -1197,10 +1703,25 @@ function openInstallmentModal(enrollmentId){
 }
 
 /* ============================================================================
-   7. DISKUSI SBAR BERLANGGANAN (QRIS) & PEMESANAN ALKES (PESERTA)
+7. DISKUSI SBAR BERLANGGANAN (QRIS) & PEMESANAN ALKES (PESERTA)
    ============================================================================ */
-function renderMemberChatAndAlkes(){
+function renderMemberChatAndAlkes(force=false){
   const root=$('#portal-content');
+  if(chatSubTab==='consult' && profile?.chatAccess && $('#messages') && !force){
+    return;
+  }
+  const sig = JSON.stringify({
+    chatSubTab,
+    chatAccess: Boolean(profile?.chatAccess),
+    alkes: state.alkes.filter(a=>!a.kind||a.kind==='alkes'),
+    alkesCart,
+    alkesOrders: state.alkesOrders,
+    chatPayments: state.chatPayments,
+    chatFee: state.cms.chatFee,
+    chatDurationLabel: state.cms.chatDurationLabel
+  });
+  if(!shouldRender('chat', sig, force)) return;
+
   const switcher=`
     <div class="row" style="gap:8px;margin-bottom:16px;flex-wrap:wrap">
       <button type="button" class="button ${chatSubTab==='consult'?'green':'ghost'}" data-action="chat-subtab" data-id="consult">Diskusi Klinis (SBAR)</button>
@@ -1305,9 +1826,22 @@ function renderMemberChatAndAlkes(){
 }
 
 /* ============================================================================
-   8. ADMIN: KEUANGAN, QRIS, ALKES & PESERTA / ANGKATAN
+8. ADMIN: KEUANGAN, QRIS, ALKES & PESERTA / ANGKATAN
    ============================================================================ */
-function renderFinanceAdmin(){
+function renderFinanceAdmin(force=false){
+  const sig = JSON.stringify({
+    financeFilterProgram,
+    enrollments: state.enrollments,
+    chatPayments: state.chatPayments,
+    alkesOrders: state.alkesOrders,
+    expenses: state.expenses,
+    alkes: state.alkes,
+    programs: state.programs.map(p=>[p.id,p.title]),
+    users: state.users.map(u=>[u.id,u.name,u.fullTitleName,u.institution]),
+    cms: {q:state.cms.qrisPath,p:state.cms.paymentInfo,f:state.cms.chatFee,d:state.cms.chatDurationLabel}
+  });
+  if(!shouldRender('finance', sig, force)) return;
+
   const recap=HauraFinance.calculateRecap(state.enrollments, state.chatPayments, state.alkesOrders, state.expenses, financeFilterProgram);
   const programOptions=`<option value="ALL" ${financeFilterProgram==='ALL'?'selected':''}>Semua Pemasukan & Program</option>`+
     state.programs.map(p=>`<option value="${esc(p.id)}" ${financeFilterProgram===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
@@ -1542,8 +2076,9 @@ function openGradeModal(enrollmentId){
   `);
 }
 
-function renderValidation(){
+function renderValidation(force=false){
   const allUsers=state.users.filter(u=>u.id!==me.uid);
+  if(!shouldRender('validation', {valFilterBatch, allUsers}, force)) return;
   const batches=[...new Set(allUsers.map(u=>u.batch).filter(Boolean))];
   const list=valFilterBatch==='ALL'?allUsers:allUsers.filter(u=>(u.batch||'')===valFilterBatch);
 
@@ -1637,8 +2172,21 @@ function renderCMS(){
 
 function userOptions(all=false){return `${all?'<option value="all">Semua Peserta Aktif</option>':'<option value="">— Pilih Peserta —</option>'}${state.users.filter(u=>u.status==='approved').map(u=>`<option value="${esc(u.id)}">${esc(u.fullTitleName||u.name)}</option>`).join('')}`;}
 
-function renderAdminChat(){ $('#portal-content').innerHTML='<h2>Diskusi Klinis (SBAR)</h2><div class="chat-layout"><div class="chat-users" id="chat-users"></div><div id="chat-host" class="chat-room"><p class="empty">Pilih peserta untuk membuka percakapan.</p></div></div>';renderChatUsers();if(targetChat)createRoom(targetChat,state.users.find(u=>u.id===targetChat)?.name||'Peserta'); }
-function renderChatUsers(){const el=$('#chat-users');if(!el)return;el.innerHTML=state.users.filter(u=>u.status==='approved'&&u.chatAccess).map(u=>`<button class="chat-user ${targetChat===u.id?'active':''}" data-action="open-chat" data-id="${esc(u.id)}">${esc(u.fullTitleName||u.name)}<br><small>${esc(u.institution||'')}</small></button>`).join('')||empty('Belum ada peserta aktif.');}
+function renderAdminChat(force=false){
+  if($('#chat-users') && !force){
+    renderChatUsers(false);
+    return;
+  }
+  $('#portal-content').innerHTML='<h2>Diskusi Klinis (SBAR)</h2><div class="chat-layout"><div class="chat-users" id="chat-users"></div><div id="chat-host" class="chat-room"><p class="empty">Pilih peserta untuk membuka percakapan.</p></div></div>';
+  renderChatUsers(true);
+  if(targetChat)createRoom(targetChat,state.users.find(u=>u.id===targetChat)?.name||'Peserta');
+}
+function renderChatUsers(force=false){
+  const el=$('#chat-users');if(!el)return;
+  const activeUsers = state.users.filter(u=>u.status==='approved'&&u.chatAccess);
+  if(!shouldRender('chat-users', {targetChat, activeUsers: activeUsers.map(u=>[u.id,u.name,u.fullTitleName,u.institution])}, force)) return;
+  el.innerHTML=activeUsers.map(u=>`<button class="chat-user ${targetChat===u.id?'active':''}" data-action="open-chat" data-id="${esc(u.id)}">${esc(u.fullTitleName||u.name)}<br><small>${esc(u.institution||'')}</small></button>`).join('')||empty('Belum ada peserta aktif.');
+}
 function createRoom(id,name){
   targetChat=id;chatStop?.();state.messages=[];messageLimit=100;
   $('#chat-host').innerHTML=`<div class="chat-header">${esc(name)}</div><div class="chat-tools"><button class="button small" data-action="older-chat">Riwayat Sebelumnya</button>${!admin?' <button class="button green small" data-action="sbar">+ Form SBAR</button>':''}</div><div class="messages" id="messages" aria-live="polite"></div><form class="chat-form" data-form="chat"><label class="sr-only" for="chat-text">Pesan</label><input id="chat-text" name="text" required maxlength="4000" placeholder="Tulis pesan…" autocomplete="off"><button class="button" type="submit">Kirim</button></form>`;
@@ -1647,6 +2195,7 @@ function createRoom(id,name){
 function watchMessages(){chatStop?.();chatStop=B.watch(`conversations/${targetChat}/messages`,[B.F.orderBy('createdAt','desc'),B.F.limit(messageLimit)],rows=>{state.messages=rows.reverse();renderMessages();},fail);}
 function renderMessages(){
   const el=$('#messages');if(!el)return;
+  if(!shouldRender('chat-msgs', {targetChat, msgs: state.messages}, false)) return;
   el.innerHTML=state.messages.map(m=>{
     if(m.kind==='sbar'){
       return `<div class="message ${m.senderId===me.uid?'mine':''}"><b>LAPORAN SBAR</b>${['s','b','a','r'].map(k=>`<p><b>${k.toUpperCase()}:</b> ${esc(m.sbar?.[k])}</p>`).join('')}<time>${date(m.createdAt)||'Mengirim…'}</time></div>`;
@@ -1680,7 +2229,23 @@ async function doAction(action,el){
   if(action==='close-modal')return close();
   if(action==='install-help')return installHelp();
   if(action==='privacy')return modal('Ketentuan Layanan',`<div class="privacy">${esc(privacyText)}</div>`);
-  if(action==='logout'){ready();await B.F.signOut(B.authInstance());close();toast('Berhasil keluar.');return;}
+  if(action==='offline-pass')return openOfflinePasswordModal();
+  if(action==='logout'){
+    OfflineAuth.clearActive();
+    if(isOffline() || me?.offline){
+      stopPrivate();
+      me=null;profile=null;admin=false;
+      navRender();
+      showLanding();
+      close();
+      return toast('Keluar dari sesi offline.');
+    }
+    ready();
+    await B.F.signOut(B.authInstance());
+    close();
+    toast('Berhasil keluar.');
+    return;
+  }
   if(action==='dashboard')return dashboard();
   if(action==='edit-biodata'){member();return openBiodataModal(me.uid);}
   if(action==='admin-edit-biodata'){adminOnly();return openBiodataModal(el.dataset.id);}
@@ -1702,18 +2267,36 @@ async function doAction(action,el){
   if(action==='change-password'){ready();if(!me)throw new Error('Silakan masuk.');return modal('Ganti Password',B.accountFrame('change'));}
   if(action==='reset-member'){adminOnly();return modal('Reset Password Peserta',`<p>Buat password sementara untuk peserta ini?</p><button class="button danger" data-action="confirm-reset" data-id="${esc(el.dataset.id)}">Buat Password Sementara</button>`);}
   if(action==='confirm-reset'){adminOnly();const result=await B.resetMember(el.dataset.id);return modal('Password Sementara',`<code style="word-break:break-all">${esc(result.temporary)}</code>`);}
-  if(action==='refresh-auth'){await B.F.reload(me);await B.F.getIdTokenResult(me,true);await handleSession(B.authInstance().currentUser);return;}
-  if(action==='tab'){member();chatStop?.();chatStop=null;tab=el.dataset.id;tabsRender();renderTab(true);return;}
-  if(action==='chat-subtab'){member();chatSubTab=el.dataset.id;renderMemberChatAndAlkes();hydrate();return;}
-  if(action==='alkes-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);alkesCart[id]=Math.max(0,(Number(alkesCart[id]||0)+delta));renderMemberChatAndAlkes();hydrate();return;}
-  if(action==='baju-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);bajuCart[id]=Math.max(0,(Number(bajuCart[id]||0)+delta));renderMemberBaju();hydrate();return;}
+  if(action==='refresh-auth'){ready();await B.F.reload(me);await B.F.getIdTokenResult(me,true);await handleSession(B.authInstance().currentUser);return;}
+  if(action==='tab'){
+    if(isOffline() && el.dataset.id !== 'modules'){
+      throw new Error('Mode offline aktif. Hanya menu Buku Digital yang dapat dibuka tanpa internet.');
+    }
+    if(isOffline()) memberBooksAccess(); else member();
+    chatStop?.();chatStop=null;
+    tab=el.dataset.id;
+    tabsRender(true);
+    renderTab(true);
+    return;
+  }
+  if(action==='chat-subtab'){member();chatSubTab=el.dataset.id;renderMemberChatAndAlkes(true);hydrate();return;}
+  if(action==='alkes-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);alkesCart[id]=Math.max(0,(Number(alkesCart[id]||0)+delta));renderMemberChatAndAlkes(true);hydrate();return;}
+  if(action==='baju-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);bajuCart[id]=Math.max(0,(Number(bajuCart[id]||0)+delta));renderMemberBaju(true);hydrate();return;}
 
   if(action==='read-ebook'){
-    member();
+    memberBooksAccess();
     const b=state.ebooks.find(x=>x.id===el.dataset.id);
     if(!b||!b.htmlPath)throw new Error('Buku digital tidak ditemukan.');
-    toast('Memuat buku digital…');
-    const html=await B.readHtmlFile(b.htmlPath);
+    let html = await getOfflineEbookHtml(b.id);
+    if(!html){
+      if(isOffline()) throw new Error('Buku ini belum tersimpan offline. Hubungkan ke internet sebentar untuk mengunduhnya.');
+      toast('Memuat & menyimpan buku digital untuk offline…');
+      html = await B.readHtmlFile(b.htmlPath);
+      if(html){
+        await saveOfflineEbookHtml(b, html);
+        if(tab === 'modules') renderMemberModules(true);
+      }
+    }
     openEbookReader({...b,_htmlContent:html});
     return;
   }
@@ -1769,8 +2352,8 @@ async function doAction(action,el){
   if(action==='remove-video'){adminOnly();await B.patch('settings','public',{videoPath:'',updatedAt:B.stamp()});return toast('Video dihapus.');}
   if(action==='remove-qris'){adminOnly();await B.patch('settings','public',{qrisPath:'',updatedAt:B.stamp()});return toast('QRIS dihapus.');}
   if(action==='sbar'){member();if(!profile.chatAccess)throw new Error('Akses diskusi belum aktif.');return sbarForm();}
-  if(action==='open-chat'){adminOnly();const u=state.users.find(u=>u.id===el.dataset.id);createRoom(u.id,u.fullTitleName||u.name);return renderChatUsers();}
-  if(action==='older-chat'){messageLimit=Math.min(messageLimit+100,1000);watchMessages();return;}
+  if(action==='open-chat'){adminOnly();const u=state.users.find(u=>u.id===el.dataset.id);createRoom(u.id,u.fullTitleName||u.name);return renderChatUsers(true);}
+  if(action==='older-chat'){ready();messageLimit=Math.min(messageLimit+100,1000);watchMessages();return;}
 
   if(action==='cert-select-all'){document.querySelectorAll('.cert-pick').forEach(cb=>cb.checked=true);updateCertificate();return;}
   if(action==='cert-unselect-all'){document.querySelectorAll('.cert-pick').forEach(cb=>cb.checked=false);updateCertificate();return;}
@@ -1832,7 +2415,7 @@ async function doAction(action,el){
   if(action==='preview-pdf'){adminOnly();toast('Menyiapkan PDF…');const canvas=await captureCertificate();return pdfDownload(canvas.toDataURL('image/jpeg',.96),'Sertifikat_Preview');}
   if(action==='approve-user'||action==='reject-user'){adminOnly();await B.patch('users',el.dataset.id,{status:action==='approve-user'?'approved':'rejected',...(action==='reject-user'?{chatAccess:false}:{}),updatedAt:B.stamp()});return toast('Status akun diperbarui.');}
   if(['archive-program','archive-news','delete-module'].includes(action)){adminOnly();return modal('Konfirmasi',`<p>Lanjutkan tindakan ini?</p><button class="button danger" data-action="confirm-change" data-kind="${action}" data-id="${esc(el.dataset.id)}">Ya, Lanjutkan</button>`);}
-  if(action==='confirm-change'){adminOnly();const kind=el.dataset.kind;if(kind==='delete-module')await B.remove('ebooks',el.dataset.id);else await B.patch(kind==='archive-program'?'programs':'news',el.dataset.id,{published:false,updatedAt:B.stamp()});close();if(tab==='cms')renderCMS();if(tab==='modules-admin')setTimeout(renderModuleAdmin,200);if(tab==='pmk-admin')setTimeout(renderPMKAdmin,200);return toast('Perubahan tersimpan.');}
+  if(action==='confirm-change'){adminOnly();const kind=el.dataset.kind;if(kind==='delete-module')await B.remove('ebooks',el.dataset.id);else await B.patch(kind==='archive-program'?'programs':'news',el.dataset.id,{published:false,updatedAt:B.stamp()});close();if(tab==='cms')renderCMS();if(tab==='modules-admin')setTimeout(renderModuleAdmin,200);if(tab==='pmk-admin')setTimeout(()=>renderPMKAdmin(true),200);return toast('Perubahan tersimpan.');}
   if(action==='edit-program'){
     adminOnly();
     const p=state.programs.find(p=>p.id===el.dataset.id);
@@ -1848,7 +2431,28 @@ async function doAction(action,el){
 }
 
 async function doSubmit(form){
-  const type=form.dataset.form,d=new FormData(form);ready();
+  const type=form.dataset.form,d=new FormData(form);
+
+  if(type==='offline-login'){
+    const acc = await OfflineAuth.verifyLogin(d.get('email'), d.get('offlinePassword')||'');
+    close();
+    await enterOfflineSession(acc);
+    return toast('Berhasil masuk mode offline. Selamat membaca buku digital.');
+  }
+
+  ready();
+
+  if(type==='set-offline-password'){
+    if(!me) throw new Error('Silakan masuk.');
+    const p1 = String(d.get('newOfflinePass')||'');
+    const p2 = String(d.get('confirmOfflinePass')||'');
+    if(p1.length < 4) throw new Error('Password minimal 4 karakter.');
+    if(p1 !== p2) throw new Error('Konfirmasi password tidak cocok.');
+    OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin});
+    await OfflineAuth.setOfflinePassword(me.uid, p1);
+    close();
+    return toast('Password Login Offline berhasil disimpan.');
+  }
 
   if(type==='save-biodata'){
     if(!me)throw new Error('Silakan masuk.');
@@ -1882,6 +2486,7 @@ async function doSubmit(form){
     await B.patch('users',targetUid,patchData);
     if(targetUid===me.uid && profile){
       Object.assign(profile,patchData);
+      OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin});
       navRender();
       if(!$('#portal-view').hidden)dashboard();
     }
@@ -2180,7 +2785,8 @@ async function doSubmit(form){
     const htmlPath=`ebooks/${me.uid}/${uid()}`;
     toast('Menyimpan buku digital…');
     await B.upload(htmlPath,blob,['text/html'],5*1024*1024);
-    await B.add('ebooks',{title,description,kind:'html',htmlPath,url:'',physicalPrice,physicalAlkesId,userId:d.get('userId'),createdAt:B.stamp()});
+    const created=await B.add('ebooks',{title,description,kind:'html',htmlPath,url:'',physicalPrice,physicalAlkesId,userId:d.get('userId'),createdAt:B.stamp()});
+    if(created?.id) await saveOfflineEbookHtml({id:created.id,htmlPath,title}, htmlStr);
     form.reset();
     toast('Buku digital dipublikasikan.');
     setTimeout(renderModuleAdmin,200);
@@ -2256,13 +2862,35 @@ async function doSubmit(form){
   }
 }
 
-document.addEventListener('click',async event=>{const el=event.target.closest('[data-action]');if(!el)return;event.preventDefault();if(el.disabled)return;el.disabled=true;try{await doAction(el.dataset.action,el);}catch(e){fail(e);}finally{el.disabled=false;}});
-document.addEventListener('submit',async event=>{const form=event.target.closest('form[data-form]');if(!form)return;event.preventDefault();const button=form.querySelector('[type=submit]');if(button?.disabled)return;if(button)button.disabled=true;try{await doSubmit(form);}catch(e){fail(e);}finally{if(button)button.disabled=false;}});
-document.addEventListener('input',event=>{if(event.target.closest('#certificate-form'))updateCertificate();});
+document.addEventListener('click',async event=>{
+  markUserActivity();
+  const el=event.target.closest('[data-action]');
+  if(!el)return;
+  event.preventDefault();
+  if(el.disabled)return;
+  el.disabled=true;
+  try{await doAction(el.dataset.action,el);}catch(e){fail(e);}finally{el.disabled=false;}
+});
+document.addEventListener('submit',async event=>{
+  markUserActivity();
+  const form=event.target.closest('form[data-form]');
+  if(!form)return;
+  event.preventDefault();
+  const button=form.querySelector('[type=submit]');
+  if(button?.disabled)return;
+  if(button)button.disabled=true;
+  try{await doSubmit(form);}catch(e){fail(e);}finally{if(button)button.disabled=false;}
+});
+document.addEventListener('input',event=>{
+  markUserActivity();
+  if(event.target.closest('#certificate-form'))updateCertificate();
+});
+document.addEventListener('keydown', markUserActivity);
 document.addEventListener('change',async event=>{
+  markUserActivity();
   const el=event.target;
-  if(el.id==='finance-filter'){financeFilterProgram=el.value;renderFinanceAdmin();hydrate();return;}
-  if(el.id==='val-batch-filter'){valFilterBatch=el.value;renderValidation();return;}
+  if(el.id==='finance-filter'){financeFilterProgram=el.value;renderFinanceAdmin(true);hydrate();return;}
+  if(el.id==='val-batch-filter'){valFilterBatch=el.value;renderValidation(true);return;}
   if(el.id==='cert-filter-prog'){certFilterProg=el.value;renderCertificateEditor();return;}
   if(el.id==='cert-filter-batch'){certFilterBatch=el.value;renderCertificateEditor();return;}
   if(el.classList?.contains('cert-pick')){updateCertificate();return;}
@@ -2272,14 +2900,70 @@ document.addEventListener('change',async event=>{
 $('#modal').addEventListener('click',event=>{if(event.target===$('#modal')){const r=event.target.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)close();}});
 window.addEventListener('hashchange',()=>{if(location.hash==='#beranda')showLanding();});
 
+window.addEventListener('offline', () => {
+  navRender();
+  if(me && profile){
+    tab = 'modules';
+    dashboard();
+    toast('Koneksi terputus. Beralih ke Mode Offline (Login & Buku Digital tetap tersedia).');
+  } else {
+    publicRender();
+  }
+});
+
+window.addEventListener('online', async () => {
+  navRender();
+  if(me?.offline){
+    const currentUser = B?.authInstance?.().currentUser;
+    if(currentUser){
+      await handleSession(currentUser);
+      toast('Koneksi online kembali. Semua fitur portal aktif.');
+    } else {
+      toast('Koneksi internet aktif kembali. Silakan masuk ulang jika ingin membuka fitur transaksi.');
+      publicRender();
+    }
+  } else if(me && profile){
+    startPrivate();
+    dashboard();
+    toast('Koneksi internet aktif kembali.');
+  } else {
+    publicRender();
+  }
+});
+
 async function start(){
+  await refreshOfflineBookIndex();
   try{
     B=await import('./backend.js');
-    if(!await B.init()){const notice=$('#setup-status');notice.hidden=false;notice.textContent='Konfigurasi server belum tersambung.';publicRender();return;}
-    publicSubscriptions.push(B.F.onSnapshot(B.F.doc(B.dbInstance(),'settings','public'),snap=>{if(snap.exists())state.cms={...state.cms,...snap.data()};publicRender();checkPublicVerification();},fail));
-    for(const key of ['programs','news','alkes'])publicSubscriptions.push(B.watch(key,[B.F.where('published','==',true)],rows=>{state[key]=rows;publicRender();refreshSection();},fail));
+    if(!await B.init()){
+      if(isOffline()){
+        const saved = OfflineAuth.getActiveAccount();
+        if(saved){ await enterOfflineSession(saved); return; }
+      }
+      const notice=$('#setup-status');notice.hidden=false;notice.textContent='Konfigurasi server belum tersambung.';
+      navRender();
+      publicRender();
+      return;
+    }
+    if(isOffline()){
+      const saved = OfflineAuth.getActiveAccount();
+      if(saved){ await enterOfflineSession(saved); return; }
+      navRender();
+      publicRender();
+    }
+    publicSubscriptions.push(B.F.onSnapshot(B.F.doc(B.dbInstance(),'settings','public'),snap=>{if(snap.exists())state.cms={...state.cms,...snap.data()};schedulePublicRender();checkPublicVerification();},fail));
+    for(const key of ['programs','news','alkes'])publicSubscriptions.push(B.watch(key,[B.F.where('published','==',true)],rows=>{state[key]=rows;schedulePublicRender();scheduleRefreshSection();},fail));
     B.F.onAuthStateChanged(B.authInstance(),user=>{if(!registering)handleSession(user);});
-  }catch(e){const notice=$('#setup-status');notice.hidden=false;notice.textContent='Portal belum terhubung.';publicRender();}
+  }catch(e){
+    if(isOffline()){
+      const saved = OfflineAuth.getActiveAccount();
+      if(saved){ await enterOfflineSession(saved); return; }
+      navRender();
+      publicRender();
+      return;
+    }
+    const notice=$('#setup-status');notice.hidden=false;notice.textContent='Portal belum terhubung.';publicRender();
+  }
 }
 start();
 
