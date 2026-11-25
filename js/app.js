@@ -14,14 +14,25 @@ let alkesCart={}, bajuCart={};
 let activeReaderBookId='';
 let verifyHandled=false;
 let offlineBookIds=new Set();
-let state={cms:{logoText:'HAURA',logoPath:'',welcomeTitle:'Tumbuh bersama. Merawat lebih baik.',welcomeText:'Pelatihan keperawatan, buku digital, konsultasi klinis, dan pendampingan praktik mandiri dalam satu portal.',chatFee:50000,chatDurationLabel:'30 Hari',videoUrl:'',videoPath:'',qrisPath:'',paymentInfo:'',certIndex:{}},programs:[],news:[],users:[],enrollments:[],chatPayments:[],alkes:[],alkesOrders:[],ebooks:[],certificates:[],expenses:[],messages:[]};
+let bannerIdx=0, bannerTimer=null;
+let state={
+  cms:{
+    logoText:'HAURA',logoPath:'',welcomeTitle:'Tumbuh bersama. Merawat lebih baik.',
+    welcomeText:'Pelatihan keperawatan, buku digital, konsultasi klinis, dan pendampingan praktik mandiri dalam satu portal.',
+    chatFee:50000,chatDurationLabel:'30 Hari',videoUrl:'',videoPath:'',qrisPath:'',paymentInfo:'',
+    certIndex:{},banners:[],subscriptionGate:{enabled:false,price:50000,durationDays:365,packageName:'Akses Portal & Modul 1 Tahun'},
+    charity:{enabled:true,title:'Celengan Amal Haura Institute',description:'Dana sosial untuk kegiatan kemanusiaan, santunan, dan bakti kesehatan masyarakat.',totalCollected:0,totalDistributed:0}
+  },
+  programs:[],news:[],users:[],enrollments:[],chatPayments:[],accessPayments:[],donations:[],alkes:[],alkesOrders:[],ebooks:[],certificates:[],expenses:[],messages:[]
+};
 let certImages={main:'./assets/logo.png',partner:'',left:'',right:''};
 
 const isOffline = () => !navigator.onLine;
 const isOfflineSession = () => Boolean(me?.offline || isOffline());
+const nowServerMs = () => B?.getServerTime ? B.getServerTime() : Date.now();
 
 /* ============================================================================
-   ANTI-FREEZE / SMART RENDER SCHEDULER (CEGAH JEDA SAAT MENGETIK & BACA BUKU)
+   ANTI-FREEZE / SMART RENDER SCHEDULER
    ============================================================================ */
 let lastUserInputAt = 0;
 let pendingRefresh = false;
@@ -82,14 +93,30 @@ setInterval(() => {
 }, 1500);
 
 /* ============================================================================
-   PENYIMPANAN OFFLINE (INDEXEDDB UNTUK BUKU DIGITAL & LOCALSTORAGE UNTUK LOGIN)
+   PENYIMPANAN OFFLINE (INDEXEDDB BUKU DIGITAL & LOCALSTORAGE AKUN + WAKTU)
    ============================================================================ */
 const OFFLINE_ACCOUNTS_KEY = 'haura_offline_accounts_v1';
 const OFFLINE_ACTIVE_KEY = 'haura_offline_active_uid_v1';
+const OFFLINE_TIME_GUARD_KEY = 'haura_server_time_guard_v1';
 const OFFLINE_DB_NAME = 'haura_offline_books_db';
 const OFFLINE_DB_VER = 1;
 let offlineDbPromise = null;
 let cachingQueueRunning = false;
+
+function recordTrustedTime(ms){
+  const n = Number(ms || 0);
+  if(!Number.isFinite(n) || n <= 0) return;
+  try{
+    const prev = Number(localStorage.getItem(OFFLINE_TIME_GUARD_KEY) || 0);
+    if(n > prev) localStorage.setItem(OFFLINE_TIME_GUARD_KEY, String(n));
+  }catch{}
+}
+function getTrustedTimeMs(){
+  let guard = 0;
+  try{ guard = Number(localStorage.getItem(OFFLINE_TIME_GUARD_KEY) || 0); }catch{}
+  return Math.max(nowServerMs(), guard, Date.now());
+}
+document.addEventListener('haura-server-time', e => recordTrustedTime(e?.detail?.serverTime));
 
 function openOfflineDB(){
   if(offlineDbPromise) return offlineDbPromise;
@@ -215,7 +242,7 @@ const OfflineAuth = {
   writeAll(map){
     try{ localStorage.setItem(OFFLINE_ACCOUNTS_KEY, JSON.stringify(map)); }catch{}
   },
-  saveSession({uid: userId, email, profile: prof, admin: isAdm}){
+  saveSession({uid: userId, email, profile: prof, admin: isAdm, gate}){
     if(!userId || !prof) return;
     if(!isAdm && prof.status !== 'approved') return;
     const map = this.all();
@@ -226,6 +253,7 @@ const OfflineAuth = {
       email: normEmail,
       admin: Boolean(isAdm),
       profile: {...prof},
+      gate: gate || prev.gate || state.cms.subscriptionGate || {enabled:false},
       passHash: prev.passHash || '',
       passSalt: prev.passSalt || '',
       savedAt: Date.now()
@@ -295,7 +323,24 @@ function youtubeEmbedURL(v){
     else if(parsed.pathname.startsWith('/embed/'))id=parsed.pathname.split('/')[2]||'';
     else if(parsed.pathname.startsWith('/shorts/'))id=parsed.pathname.split('/')[2]||'';
   }
-  return /^[A-Za-z0-9_-]{11}$/.test(id)?`https://www.youtube-nocookie.com/embed/${id}?rel=0`:'';
+  return /^[A-Za-z0-9_-]{11}$/.test(id)?`https://www.youtube-nocookie.com/embed/${id}?autoplay=1&mute=1&loop=1&playlist=${id}&rel=0`:'';
+}
+
+function getEffectiveGate(){
+  if(state.cms?.subscriptionGate && typeof state.cms.subscriptionGate.enabled === 'boolean'){
+    return state.cms.subscriptionGate;
+  }
+  const acc = me?.uid ? OfflineAuth.all()[me.uid] : null;
+  return acc?.gate || {enabled:false};
+}
+
+function getAccessCheck(){
+  if(!me || !profile) return {blocked:false};
+  return HauraFinance.checkSubscriptionGate(profile, {subscriptionGate: getEffectiveGate()}, getTrustedTimeMs(), admin);
+}
+
+function hasEffectiveChatAccess(){
+  return HauraFinance.canAccessChat(profile, state.enrollments, admin);
 }
 
 function ready(){
@@ -306,10 +351,14 @@ function member(){
   ready();
   if(!me||!profile) throw new Error('Silakan masuk terlebih dahulu.');
   if(!admin&&(profile.status!=='approved')) throw new Error('Akun menunggu aktivasi admin.');
+  const gate = getAccessCheck();
+  if(gate.blocked) throw new Error('Paket akses portal Anda belum aktif atau masa aktifnya telah berakhir.');
 }
 function memberBooksAccess(){
   if(!me||!profile) throw new Error('Silakan masuk terlebih dahulu.');
   if(!admin&&(profile.status!=='approved')) throw new Error('Akun menunggu aktivasi admin.');
+  const gate = getAccessCheck();
+  if(gate.blocked) throw new Error('Masa aktif paket akses Anda telah habis. Silakan perpanjang akses saat online.');
 }
 function adminOnly(){member();if(!admin)throw new Error('Akses khusus admin.');}
 
@@ -329,7 +378,7 @@ async function hydrate(){
 }
 
 /* ============================================================================
-   GENERATOR QR CODE MANDIRI (SCANNABLE UNTUK SERTIFIKAT & ID CARD)
+   GENERATOR QR CODE MANDIRI
    ============================================================================ */
 const QR_EXP=new Uint8Array(512), QR_LOG=new Uint8Array(256);
 (()=>{let x=1;for(let i=0;i<255;i++){QR_EXP[i]=x;QR_EXP[i+255]=x;QR_LOG[x]=i;x=(x<<1)^(x&128?0x11d:0);}})();
@@ -462,41 +511,198 @@ function certVerifyURL(serial){
 }
 
 /* ============================================================================
-   PENGECEKAN ORISINALITAS SERTIFIKAT (SCAN QR / BARCODE PUBLIK)
+   VERIFIKASI PUBLIK SERTIFIKAT & KUITANSI DIGITAL (URL PARAMETER)
    ============================================================================ */
-function checkPublicVerification(){
+async function checkPublicVerification(){
   if(verifyHandled || isOffline())return;
   const params=new URLSearchParams(location.search);
   const serial=(params.get('verify')||'').trim();
-  if(!serial)return;
-  const idx=state.cms?.certIndex||{};
-  const rec=idx[serial]||Object.values(idx).find(x=>String(x.serial||'').toLowerCase()===serial.toLowerCase());
-  if(!rec)return;
-  verifyHandled=true;
-  modal('Verifikasi Orisinalitas Sertifikat',`
-    <div style="background:#ecfdf5;border:2px solid #059669;border-radius:12px;padding:16px;margin-bottom:14px">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-        <span style="background:#059669;color:#fff;font-weight:800;padding:4px 10px;border-radius:999px;font-size:12px">✓ TERVERIFIKASI ASLI</span>
-        <b style="color:#065f46;font-size:15px">HAURA INSTITUTE</b>
+  const receiptNo=(params.get('kuitansi')||'').trim();
+
+  if(serial){
+    const idx=state.cms?.certIndex||{};
+    const rec=idx[serial]||Object.values(idx).find(x=>String(x.serial||'').toLowerCase()===serial.toLowerCase());
+    if(!rec)return;
+    verifyHandled=true;
+    modal('Verifikasi Orisinalitas Sertifikat',`
+      <div style="background:#ecfdf5;border:2px solid #059669;border-radius:12px;padding:16px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <span style="background:#059669;color:#fff;font-weight:800;padding:4px 10px;border-radius:999px;font-size:12px">✓ TERVERIFIKASI ASLI</span>
+          <b style="color:#065f46;font-size:15px">HAURA INSTITUTE</b>
+        </div>
+        <p style="margin:0 0 10px;color:#064e3b;font-size:14px;line-height:1.5">
+          <b>Pernyataan Resmi Haura Institute:</b> Sertifikat digital ini adalah <b>BENAR, SAH, dan tercatat resmi</b> dalam pangkalan data Haura Institute dengan rincian sebagai berikut:
+        </p>
+        <table style="width:100%;font-size:13px;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden">
+          <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569;width:38%">Nomor Sertifikat</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.serial)}</b></td></tr>
+          <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Nama Pemilik</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.name)}</b></td></tr>
+          <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Instansi</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5">${esc(rec.institution||'-')}</td></tr>
+          <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Program Pelatihan</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.course)}</b></td></tr>
+          <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Predikat</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.predicate||'PARTICIPANT')}</b></td></tr>
+          <tr><td style="padding:7px 10px;color:#475569">Tanggal Terbit</td><td style="padding:7px 10px">${esc(rec.issuedDate||'-')}</td></tr>
+        </table>
       </div>
-      <p style="margin:0 0 10px;color:#064e3b;font-size:14px;line-height:1.5">
-        <b>Pernyataan Resmi Haura Institute:</b> Sertifikat digital ini adalah <b>BENAR, SAH, dan tercatat resmi</b> dalam pangkalan data Haura Institute dengan rincian sebagai berikut:
-      </p>
+      ${rec.imagePath?`
+        <div style="text-align:center">
+          <p style="font-size:13px;font-weight:700;margin:0 0 8px">Dokumen Sertifikat Digital Resmi:</p>
+          <img src="./assets/logo.png" data-file="${esc(rec.imagePath)}" alt="Sertifikat ${esc(rec.name)}" style="width:100%;border-radius:10px;border:1px solid #cbd5e1;box-shadow:0 4px 12px rgba(0,0,0,.08)">
+        </div>
+      `:''}
+    `);
+    return;
+  }
+
+  if(receiptNo && B?.verifyReceipt){
+    verifyHandled=true;
+    try{
+      const res = await B.verifyReceipt(receiptNo);
+      if(res?.valid && res.receipt){
+        showReceiptVerificationResult(res.receipt);
+      }
+    }catch{}
+  }
+}
+
+function showReceiptVerificationResult(r){
+  modal('Verifikasi Keaslian Kuitansi',`
+    <div style="background:#ecfdf5;border:2px solid #059669;border-radius:12px;padding:16px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <span style="background:#059669;color:#fff;font-weight:800;padding:4px 10px;border-radius:999px;font-size:12px">✓ KUITANSI SAH</span>
+        <b style="color:#065f46">${esc(r.receiptNumber)}</b>
+      </div>
       <table style="width:100%;font-size:13px;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden">
-        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569;width:38%">Nomor Sertifikat</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.serial)}</b></td></tr>
-        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Nama Pemilik</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.name)}</b></td></tr>
-        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Instansi</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5">${esc(rec.institution||'-')}</td></tr>
-        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Program Pelatihan</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.course)}</b></td></tr>
-        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Predikat</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.predicate||'PARTICIPANT')}</b></td></tr>
-        <tr><td style="padding:7px 10px;color:#475569">Tanggal Terbit</td><td style="padding:7px 10px">${esc(rec.issuedDate||'-')}</td></tr>
+        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Nama Pembayar</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(r.participantName||'-')}</b></td></tr>
+        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Program / Keperluan</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5">${esc(r.programTitle||'-')} (${esc(r.label||'-')})</td></tr>
+        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Metode</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${r.method==='cash'?'Tunai (Cash)':'Transfer / QRIS'}</b></td></tr>
+        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Nominal Dibayar</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b style="color:#087b4b">${money(r.amount)}</b></td></tr>
+        <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Sisa Tagihan</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${money(r.remainingBalance||0)}</b></td></tr>
+        <tr><td style="padding:7px 10px;color:#475569">Tanggal Sah</td><td style="padding:7px 10px">${date(r.confirmedAt)}</td></tr>
       </table>
     </div>
-    ${rec.imagePath?`
-      <div style="text-align:center">
-        <p style="font-size:13px;font-weight:700;margin:0 0 8px">Dokumen Sertifikat Digital Resmi:</p>
-        <img src="./assets/logo.png" data-file="${esc(rec.imagePath)}" alt="Sertifikat ${esc(rec.name)}" style="width:100%;border-radius:10px;border:1px solid #cbd5e1;box-shadow:0 4px 12px rgba(0,0,0,.08)">
+  `);
+}
+
+function openReceiptCheckModal(){
+  ready();
+  modal('Cek Keaslian Kuitansi Haura Institute',`
+    <form data-form="verify-receipt-form">
+      ${field('Masukkan Nomor Seri Kuitansi','receiptNumber','text','','required placeholder="Contoh: KWT/HI/202611/0001"')}
+      ${submit('Periksa Kuitansi','green')}
+    </form>
+  `);
+}
+
+function openReceiptWindow(receiptData){
+  const html = HauraFinance.buildReceiptHtml(receiptData, state.cms);
+  const w = window.open('', '_blank', 'noopener');
+  if(w){
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+  }else{
+    modal(`Kuitansi ${esc(receiptData.receiptNumber||'')}`,`
+      <iframe title="Kuitansi" srcdoc="${esc(html)}" style="width:100%;height:70vh;border:1px solid #cbd5e1;border-radius:8px"></iframe>
+    `);
+  }
+}
+
+/* ============================================================================
+   SLIDER GALERI BANNER BERANDA (AUTO-FIT)
+   ============================================================================ */
+function renderTopBannerSlider(){
+  const wrap = $('#top-banner-slider');
+  const track = $('#banner-track');
+  const dots = $('#banner-dots');
+  if(!wrap || !track || !dots) return;
+  const banners = Array.isArray(state.cms.banners) ? state.cms.banners.filter(b=>b && b.imagePath) : [];
+  if(!banners.length || isOffline()){
+    wrap.hidden = true;
+    clearInterval(bannerTimer);
+    bannerTimer = null;
+    return;
+  }
+  wrap.hidden = false;
+  if(bannerIdx >= banners.length) bannerIdx = 0;
+  track.innerHTML = banners.map((b,i)=>`
+    <div class="banner-slide" style="display:${i===bannerIdx?'flex':'none'};align-items:center;justify-content:center;flex-direction:column;background:#082740;border-radius:14px;overflow:hidden;position:relative;min-height:180px;max-height:360px">
+      <img src="./assets/logo.png" data-file="${esc(b.imagePath)}" alt="${esc(b.title||'Kegiatan Haura Institute')}" style="width:100%;max-height:340px;object-fit:contain;display:block;background:#061c2e">
+      ${(b.title||b.caption)?`
+        <div style="width:100%;background:rgba(8,39,64,.92);color:#fff;padding:8px 14px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <div><b>${esc(b.title||'')}</b> ${b.caption?`<span style="opacity:.85">— ${esc(b.caption)}</span>`:''}</div>
+          <small style="opacity:.75">${i+1} / ${banners.length}</small>
+        </div>
+      `:''}
+    </div>
+  `).join('');
+  dots.innerHTML = banners.map((_,i)=>`<button type="button" class="banner-dot ${i===bannerIdx?'active':''}" data-action="banner-goto" data-idx="${i}" aria-label="Slide ${i+1}"></button>`).join('');
+  hydrate();
+
+  clearInterval(bannerTimer);
+  if(banners.length > 1){
+    bannerTimer = setInterval(() => {
+      if($('#landing-view')?.hidden || $('#modal')?.open) return;
+      bannerIdx = (bannerIdx + 1) % banners.length;
+      renderTopBannerSlider();
+    }, 5500);
+  }
+}
+
+/* ============================================================================
+   CELENGAN AMAL (PUBLIK & DONASI)
+   ============================================================================ */
+function renderPublicCharity(){
+  const sec = $('#public-charity');
+  if(!sec) return;
+  const ch = state.cms.charity || {};
+  if(isOffline() || ch.enabled === false){
+    sec.hidden = true;
+    return;
+  }
+  sec.hidden = false;
+  const recap = HauraFinance.calculateCharityRecap(state.donations, ch);
+  const recentConfirmed = (state.donations || []).filter(d=>d.status==='confirmed'||d.status==='distributed').slice(0,5);
+  sec.innerHTML = `
+    <div class="panel-heading">
+      <h2>${esc(ch.title || 'Celengan Amal Haura Institute')}</h2>
+      <span class="pill" style="background:#dcfce7;color:#166534">Transparansi Sosial</span>
+    </div>
+    <p style="margin-top:0">${esc(ch.description || 'Dana sosial untuk kegiatan kemanusiaan, santunan, dan bakti kesehatan masyarakat.')}</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:14px">
+      <div class="card" style="padding:12px;background:#f0fdf4;border:1px solid #bbf7d0"><small style="color:#166534">Total Amal Terkumpul</small><div style="font-size:18px;font-weight:800;color:#087b4b;margin-top:4px">${money(recap.collected)}</div></div>
+      <div class="card" style="padding:12px"><small class="muted">Telah Tersalurkan</small><div style="font-size:18px;font-weight:800;color:#082740;margin-top:4px">${money(recap.distributed)}</div></div>
+      <div class="card" style="padding:12px;background:#fffbeb;border:1px solid #fde68a"><small style="color:#92400e">Saldo Siap Salur</small><div style="font-size:18px;font-weight:800;color:#b45309;margin-top:4px">${money(recap.balance)}</div></div>
+    </div>
+    <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+      <button type="button" class="button green" data-action="open-charity">Isi Celengan Amal Sekarang</button>
+      <small class="muted">Setiap donasi diverifikasi & dicatat secara transparan.</small>
+    </div>
+    ${recentConfirmed.length ? `
+      <div style="font-size:13px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px">
+        <b>Catatan Mutasi Terbaru:</b>
+        ${recentConfirmed.map(d=>`<div style="padding:4px 0;border-bottom:1px dashed #e2e8f0">
+          ${d.status==='distributed'
+            ? `<span style="color:#9f1734;font-weight:700">[Penyaluran] -${money(d.amount)}</span> — ${esc(d.distributionTarget||d.note||'Penyaluran Sosial')}`
+            : `<span style="color:#087b4b;font-weight:700">[Masuk] +${money(d.amount)}</span> dari <b>${esc(d.donorName||'Hamba Allah')}</b>`
+          } <small class="muted">(${date(d.confirmedAt||d.createdAt)})</small>
+        </div>`).join('')}
       </div>
-    `:''}
+    ` : ''}
+  `;
+}
+
+function openCharityModal(){
+  ready();
+  const ch = state.cms.charity || {};
+  modal(ch.title || 'Celengan Amal Haura Institute',`
+    <p style="font-size:14px">${esc(ch.description || 'Salurkan infak/sedekah terbaik Anda melalui rekening/QRIS resmi Haura Institute.')}</p>
+    ${paymentInstructionBox()}
+    <form data-form="submit-charity">
+      ${field('Nama Donatur (boleh isi "Hamba Allah")','donorName','text',profile?.fullTitleName||profile?.name||'Hamba Allah','required maxlength="120"')}
+      ${field('Nominal Amal (Rp)','amount','number','25000','required min="1000" step="1000"')}
+      ${area('Doa / Pesan Kebaikan (opsional)','note','','maxlength="300"')}
+      ${field('Bukti Transfer / QRIS','proof','file','','required accept="image/jpeg,image/png,image/webp"')}
+      ${submit('Kirim Konfirmasi Amal','green')}
+    </form>
   `);
 }
 
@@ -518,21 +724,79 @@ function applyBrandLogos(){
   }
 }
 
-function showLanding(){ $('#landing-view').hidden=false; $('#portal-view').hidden=true; }
+function showLanding(){
+  $('#landing-view').hidden=false;
+  $('#portal-view').hidden=true;
+  if($('#subscription-lock-view')) $('#subscription-lock-view').hidden=true;
+}
+
+function renderSubscriptionLockScreen(gate){
+  $('#landing-view').hidden=true;
+  $('#portal-view').hidden=true;
+  const lockView = $('#subscription-lock-view');
+  if(!lockView) return;
+  lockView.hidden = false;
+  const offline = isOffline();
+  const pendingAcc = state.accessPayments.find(p => p.status === 'pending');
+  const rejectedAcc = state.accessPayments.find(p => p.status === 'rejected');
+  const expText = gate.expiresAtMs > 0
+    ? `Masa aktif berakhir pada: <b>${new Date(gate.expiresAtMs).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'})}</b>`
+    : 'Akun Anda belum memiliki paket langganan akses aktif.';
+
+  lockView.innerHTML = `
+    <div class="panel" style="max-width:640px;margin:24px auto;border-top:5px solid #d97706">
+      <span class="eyebrow" style="background:#fef3c7;color:#92400e">PAKET AKSES PORTAL DIPERLUKAN</span>
+      <h2 style="margin:8px 0">${esc(gate.packageName || 'Akses Portal & Modul Haura Institute')}</h2>
+      <p style="font-size:14.5px;line-height:1.55">
+        Halo <b>${esc(profile?.fullTitleName||profile?.name||me?.email)}</b>, admin telah mengaktifkan sistem langganan akses portal.
+        ${expText}
+      </p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:12px;margin:14px 0">
+        <div>Biaya Langganan: <b style="font-size:18px;color:#087b4b">${money(gate.price)}</b> / <b>${gate.durationDays} Hari</b></div>
+        <small class="muted">Mencakup akses penuh ke seluruh Buku Digital, Program Pelatihan, Bimbingan UKOM, PMK, dan Sertifikat.</small>
+      </div>
+      ${offline ? `
+        <div style="background:#fef2f2;border:1px solid #fecaca;padding:12px;border-radius:8px;color:#991b1b;font-size:13.5px">
+          <b>Perangkat Sedang Offline:</b> Masa aktif langganan Anda telah habis atau belum aktif. Hubungkan ke internet untuk melakukan perpanjangan akses.
+        </div>
+      ` : (pendingAcc ? `
+        <div style="background:#fffbeb;border:1px solid #fde68a;padding:12px;border-radius:8px;color:#78350f">
+          <b>Pembayaran Paket Akses Sedang Diverifikasi Admin.</b><br>
+          <small>Nominal: ${money(pendingAcc.amount)} · Dikirim: ${date(pendingAcc.createdAt)}</small>
+        </div>
+      ` : `
+        ${rejectedAcc ? `<p><span class="status rejected">Pembayaran sebelumnya ditolak${rejectedAcc.note?': '+esc(rejectedAcc.note):''}</span></p>` : ''}
+        ${paymentInstructionBox()}
+        <form data-form="subscribe-access">
+          ${field('Upload Bukti Pembayaran Paket Akses','proof','file','','required accept="image/jpeg,image/png,image/webp"')}
+          ${submit('Kirim Bukti Aktivasi Paket Akses','green')}
+        </form>
+      `)}
+      <div class="row" style="gap:8px;margin-top:16px;flex-wrap:wrap">
+        <button type="button" class="button small" data-action="refresh-auth">Periksa Status Aktivasi</button>
+        <button type="button" class="button small ghost" data-action="logout">Keluar Akun</button>
+      </div>
+    </div>
+  `;
+  hydrate();
+}
 
 function publicRender(){
   const offline = isOffline();
   const paidPrograms=state.programs.filter(p=>(!p.kind||p.kind==='training')&&HauraFinance.programFee(p)>0);
   const sig = JSON.stringify({
     offline,
-    cms: {t:state.cms.logoText,l:state.cms.logoPath,wt:state.cms.welcomeTitle,wx:state.cms.welcomeText,vu:state.cms.videoUrl,vp:state.cms.videoPath},
+    cms: {t:state.cms.logoText,l:state.cms.logoPath,wt:state.cms.welcomeTitle,wx:state.cms.welcomeText,vu:state.cms.videoUrl,vp:state.cms.videoPath,bn:state.cms.banners,ch:state.cms.charity},
     programs: paidPrograms.map(p=>[p.id,p.title,p.description,p.totalFee,p.minDownPayment]),
-    news: state.news.map(n=>[n.id,n.title,n.content,n.createdAt])
+    news: state.news.map(n=>[n.id,n.title,n.content,n.createdAt]),
+    donationsCount: state.donations.length
   });
   if(!shouldRender('public', sig)) return;
 
   $('#brand-text').textContent=state.cms.logoText||'HAURA';
   applyBrandLogos();
+  renderTopBannerSlider();
+  renderPublicCharity();
   if(B?.configured){$('#hero-title').textContent=state.cms.welcomeTitle;$('#hero-description').textContent=state.cms.welcomeText;}
 
   const video=$('#hero-video'), iframe=$('#hero-iframe'), logo=$('#hero-logo');
@@ -546,8 +810,10 @@ function publicRender(){
     B.fileURL(drivePath).then(u=>{
       if(state.cms.videoPath!==drivePath)return;
       if(video.getAttribute('src')!==u)video.src=u;
+      video.autoplay=true;video.loop=true;video.muted=true;
       video.hidden=false;
       logo.hidden=true;
+      video.play?.().catch(()=>{});
     }).catch(()=>{});
   }else if(ytUrl && iframe){
     video.pause();video.removeAttribute('src');video.hidden=true;
@@ -557,8 +823,10 @@ function publicRender(){
   }else if(directUrl){
     if(iframe){iframe.hidden=true;iframe.removeAttribute('src');}
     if(video.getAttribute('src')!==directUrl)video.src=directUrl;
+    video.autoplay=true;video.loop=true;video.muted=true;
     video.hidden=false;
     logo.hidden=true;
+    video.play?.().catch(()=>{});
   }else{
     video.pause();video.removeAttribute('src');video.hidden=true;
     if(iframe){iframe.hidden=true;iframe.removeAttribute('src');}
@@ -605,8 +873,8 @@ function navRender(){
   `;
 }
 
-const memberTabs=[['catalog','Program & Evaluasi'],['modules','Buku Digital'],['pmk','Praktik Mandiri (PMK)'],['baju','PO Baju Kesehatan'],['certificates','Sertifikat'],['chat','Diskusi & Alkes']];
-const adminTabs=[['finance','Keuangan & Evaluasi'],['validation','Peserta & Angkatan'],['cms','CMS Web'],['modules-admin','Buku & Fisik'],['pmk-admin','Bimbingan PMK'],['baju-admin','PO Baju Kesehatan'],['cert-admin','Sertifikat & Cetak'],['chat-admin','Diskusi SBAR']];
+const memberTabs=[['catalog','Program & Evaluasi'],['modules','Buku Digital'],['ukom','Bimbingan UKOM'],['pmk','Praktik Mandiri (PMK)'],['baju','PO Baju Kesehatan'],['certificates','Sertifikat'],['chat','Diskusi & Alkes']];
+const adminTabs=[['finance','Keuangan & Evaluasi'],['validation','Peserta & Angkatan'],['cms','CMS, Banner & Amal'],['modules-admin','Buku & Fisik'],['ukom-admin','Bimbingan UKOM'],['pmk-admin','Bimbingan PMK'],['baju-admin','PO Baju Kesehatan'],['cert-admin','Sertifikat & Cetak'],['chat-admin','Diskusi SBAR']];
 
 function tabsRender(force=false){
   const offline = isOffline();
@@ -614,16 +882,19 @@ function tabsRender(force=false){
   let pendingFinance=0;
   for(const e of state.enrollments)for(const p of (e.payments||[]))if(p.status==='pending')pendingFinance++;
   for(const cp of state.chatPayments)if(cp.status==='pending')pendingFinance++;
+  for(const ap of state.accessPayments)if(ap.status==='pending')pendingFinance++;
   for(const ord of state.alkesOrders)if(ord.status==='pending')pendingFinance++;
+  const pendingCharity = state.donations.filter(d=>d.status==='pending').length;
 
   const list = offline ? [['modules','Buku Digital (Offline)']] : (admin?adminTabs:memberTabs);
-  const sig = JSON.stringify({offline, admin, tab, pendingUsers, pendingFinance});
+  const sig = JSON.stringify({offline, admin, tab, pendingUsers, pendingFinance, pendingCharity});
   if(!shouldRender('tabs', sig, force)) return;
 
   $('#tabs').innerHTML=list.map(([id,label])=>{
     let badge='';
     if(!offline && id==='validation'&&pendingUsers)badge=`<span class="badge">${pendingUsers}</span>`;
     if(!offline && id==='finance'&&pendingFinance)badge=`<span class="badge">${pendingFinance}</span>`;
+    if(!offline && id==='cms'&&pendingCharity)badge=`<span class="badge">${pendingCharity}</span>`;
     return `<button data-action="tab" data-id="${id}" aria-selected="${tab===id}">${label}${badge}</button>`;
   }).join('');
 }
@@ -633,16 +904,27 @@ function dashboard(){
   const offline = isOffline();
   if(offline) tab = 'modules';
   resetRenderHashes();
+
+  if(profile && !admin && profile.status==='approved'){
+    const gate = getAccessCheck();
+    if(gate.blocked){
+      renderSubscriptionLockScreen(gate);
+      return;
+    }
+  }
+
+  if($('#subscription-lock-view')) $('#subscription-lock-view').hidden=true;
   $('#landing-view').hidden=true;
   $('#portal-view').hidden=false;
   const displayName=profile?.fullTitleName||profile?.name||me.email;
+  const gateInfo = getAccessCheck();
   $('#portal-heading').innerHTML=`<div class="row spread" style="align-items:center;gap:14px;margin-bottom:8px;flex-wrap:wrap">
     <div class="row" style="align-items:center;gap:14px">
       ${img(profile?.photoPath,'avatar','Foto '+esc(displayName))}
       <div>
         <span class="eyebrow green">${offline?'MODE OFFLINE · BUKU DIGITAL':(admin?'PUSAT KENDALI ADMIN':'PORTAL PESERTA')}</span>
         <h2 style="margin:2px 0">${esc(displayName)}</h2>
-        <p class="muted" style="margin:0">${profile?.institution?esc(profile.institution):''}${profile?.batch?` · <b>${esc(profile.batch)}</b>`:''}</p>
+        <p class="muted" style="margin:0">${profile?.institution?esc(profile.institution):''}${profile?.batch?` · <b>${esc(profile.batch)}</b>`:''}${gateInfo.daysLeft?` · <span style="color:#087b4b">Akses Aktif (${gateInfo.daysLeft} hari tersisa)</span>`:''}</p>
       </div>
     </div>
     ${offline ? `
@@ -675,11 +957,13 @@ function renderTab(fresh=false){
   if(tab==='finance'&&admin)renderFinanceAdmin(fresh);
   if(tab==='validation')renderValidation(fresh);
   if(tab==='modules')renderMemberModules(fresh);
+  if(tab==='ukom')renderMemberUKOM(fresh);
   if(tab==='pmk')renderMemberPMK(fresh);
   if(tab==='baju')renderMemberBaju(fresh);
   if(tab==='certificates')renderMemberCertificates(fresh);
   if(tab==='cms'&&fresh)renderCMS();
   if(tab==='modules-admin'&&fresh)renderModuleAdmin();
+  if(tab==='ukom-admin')renderUKOMAdmin(fresh);
   if(tab==='pmk-admin')renderPMKAdmin(fresh);
   if(tab==='baju-admin')renderBajuAdmin(fresh);
   if(tab==='cert-admin'&&fresh)renderCertificateEditor();
@@ -689,14 +973,26 @@ function renderTab(fresh=false){
 }
 
 function refreshSection(force=false){
-  if(!me||!profile||(!admin&&(profile.status!=='approved')))return;
+  if(!me||!profile)return;
+  if(!admin && profile.status==='approved'){
+    const gate = getAccessCheck();
+    if(gate.blocked){
+      renderSubscriptionLockScreen(gate);
+      return;
+    }else if($('#subscription-lock-view') && !$('#subscription-lock-view').hidden){
+      dashboard();
+      return;
+    }
+  }
+  if(!admin&&(profile.status!=='approved'))return;
   if(isOffline()){
     if(tab !== 'modules'){ tab = 'modules'; tabsRender(true); }
     renderMemberModules(force);
     return;
   }
   if(admin) tabsRender(force);
-  if(['catalog','finance','validation','modules','pmk','baju','certificates','chat'].includes(tab)) renderTab(force);
+  if(['catalog','finance','validation','modules','ukom','pmk','baju','certificates','chat'].includes(tab)) renderTab(force);
+  if(tab==='ukom-admin') renderUKOMAdmin(force);
   if(tab==='pmk-admin') renderPMKAdmin(force);
   if(tab==='baju-admin') renderBajuAdmin(force);
   if(tab==='chat-admin') renderChatUsers(force);
@@ -710,7 +1006,7 @@ function stopPrivate(){
   subscriptions.forEach(s=>s());subscriptions=[];
   ownStop?.();ownStop=null;
   chatStop?.();chatStop=null;
-  state.users=[];state.enrollments=[];state.chatPayments=[];state.alkesOrders=[];state.ebooks=[];state.certificates=[];state.expenses=[];state.messages=[];
+  state.users=[];state.enrollments=[];state.chatPayments=[];state.accessPayments=[];state.alkesOrders=[];state.ebooks=[];state.certificates=[];state.expenses=[];state.messages=[];
   targetChat='';alkesCart={};bajuCart={};
   B?.clearFiles();
   applyBrandLogos();
@@ -741,6 +1037,7 @@ function startPrivate(){
   }
   listen('enrollments',admin?[]:own,'enrollments');
   listen('chatPayments',admin?[]:own,'chatPayments');
+  listen('accessPayments',admin?[]:own,'accessPayments');
   listen('alkesOrders',admin?[]:own,'alkesOrders');
   listen('certificates',admin?[]:own,'certificates');
   if(admin){
@@ -795,10 +1092,10 @@ async function handleSession(user){
     const token=await B.F.getIdTokenResult(user);if(epoch!==session)return;admin=token.claims.admin===true;
     ownStop=B.F.onSnapshot(B.F.doc(B.dbInstance(),'users',user.uid),snap=>{
       if(epoch!==session)return;const old=profile;profile=snap.exists()?{id:snap.id,...snap.data()}:null;
-      if(profile) OfflineAuth.saveSession({uid:user.uid, email:user.email, profile, admin});
+      if(profile) OfflineAuth.saveSession({uid:user.uid, email:user.email, profile, admin, gate: state.cms.subscriptionGate});
       if(profile?.status!=='approved'&&!admin){subscriptions.forEach(s=>s());subscriptions=[];chatStop?.();chatStop=null;B.clearFiles();}
       navRender();
-      if(!old||old.status!==profile?.status||old.chatAccess!==profile?.chatAccess||old.photoPath!==profile?.photoPath||old.fullTitleName!==profile?.fullTitleName||old.batch!==profile?.batch){
+      if(!old||old.status!==profile?.status||old.chatAccess!==profile?.chatAccess||old.accessStatus!==profile?.accessStatus||old.accessExpiresAtMs!==profile?.accessExpiresAtMs||old.photoPath!==profile?.photoPath||old.fullTitleName!==profile?.fullTitleName||old.batch!==profile?.batch){
         startPrivate();
         if(!registering){
           tab = isOffline() ? 'modules' : (admin?'finance':'catalog');
@@ -807,7 +1104,7 @@ async function handleSession(user){
       }
     },fail);
     profile=await B.read('users',user.uid);if(epoch!==session)return;
-    if(profile) OfflineAuth.saveSession({uid:user.uid, email:user.email, profile, admin});
+    if(profile) OfflineAuth.saveSession({uid:user.uid, email:user.email, profile, admin, gate: state.cms.subscriptionGate});
     startPrivate();
     tab = isOffline() ? 'modules' : (admin?'finance':'catalog');
     navRender();
@@ -913,7 +1210,6 @@ function openIdCardModal(targetUid=null){
   modal('Kartu Anggota & Peserta (ID Card)',`
     <div style="overflow-x:auto;padding:8px 0">
       <div id="idcard-preview" style="display:flex;gap:16px;flex-wrap:wrap;justify-content:center;background:#fff;padding:12px">
-        <!-- SISI DEPAN -->
         <div style="width:240px;height:380px;border-radius:14px;overflow:hidden;border:1.5px solid #082740;background:linear-gradient(160deg,#082740 0%,#0d3b5e 52%,#ffffff 52.5%);display:flex;flex-direction:column;justify-content:space-between;padding:14px;box-sizing:border-box;color:#0f172a;font-family:sans-serif">
           <div style="display:flex;align-items:center;gap:8px;color:#fff">
             <img src="${esc(logoSrc)}" alt="Logo" style="width:34px;height:34px;object-fit:contain;background:#fff;border-radius:8px;padding:2px">
@@ -939,7 +1235,6 @@ function openIdCardModal(targetUid=null){
             <img src="${qrImg}" alt="QR" style="width:44px;height:44px">
           </div>
         </div>
-        <!-- SISI BELAKANG -->
         <div style="width:240px;height:380px;border-radius:14px;overflow:hidden;border:1.5px solid #082740;background:#ffffff;display:flex;flex-direction:column;justify-content:space-between;padding:14px;box-sizing:border-box;color:#0f172a;font-family:sans-serif">
           <div>
             <div style="background:#082740;color:#fff;padding:7px 10px;border-radius:8px;font-size:11px;font-weight:700;text-align:center">IDENTITAS PEMEGANG KARTU</div>
@@ -968,12 +1263,13 @@ function openIdCardModal(targetUid=null){
 }
 
 /* ============================================================================
-1. PESERTA: PROGRAM PELATIHAN BERBAYAR, PELUNASAN & EVALUASI
+1. PESERTA: PROGRAM PELATIHAN BERBAYAR, KUITANSI, PELUNASAN & EVALUASI
    ============================================================================ */
 function renderCatalog(force=false){
   const myEnr=state.enrollments.filter(enr=>{
     const prog=state.programs.find(p=>p.id===enr.programId);
-    return (!prog?.kind || prog.kind==='training') && enr.kind!=='pmk';
+    const kind=enr.kind || prog?.kind || 'training';
+    return kind==='training';
   });
   const availablePrograms=state.programs.filter(p=>(!p.kind||p.kind==='training')&&HauraFinance.programFee(p)>0);
   if(!shouldRender('catalog', {myEnr, availablePrograms}, force)) return;
@@ -982,38 +1278,48 @@ function renderCatalog(force=false){
     const prog=state.programs.find(p=>p.id===enr.programId);
     const title=enr.programTitle||prog?.title||'Program Pelatihan';
     const st=HauraFinance.statusLabel(enr);
-    const lunas=HauraFinance.isPaidFull(enr);
-    const sisa=HauraFinance.remainingBalance(enr);
-    const hasPending=(enr.payments||[]).some(p=>p.status==='pending');
+    const bill=HauraFinance.billingBreakdown(enr);
+    const hasPending=bill.pendingPayments.length>0;
 
-    return `<article class="card" style="border-left:4px solid ${lunas?'#087b4b':'#d97706'}">
+    return `<article class="card" style="border-left:4px solid ${bill.isPaidFull?'#087b4b':'#d97706'}">
       <div class="row spread" style="flex-wrap:wrap;gap:6px">
         <b>${esc(title)}</b>
         <span class="status ${st.code}">${esc(st.text)}</span>
       </div>
       ${!HauraFinance.isLegacyFree(enr)?`
-        <p style="margin:8px 0;font-size:14px">
-          Total Biaya: <b>${money(enr.billedTotal)}</b> ·
-          Terkonfirmasi: <b style="color:#087b4b">${money(enr.paidAmount)}</b> ·
-          Sisa: <b style="color:${sisa>0?'#b45309':'#087b4b'}">${money(sisa)}</b>
-        </p>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px;margin:10px 0;background:#f8fafc;padding:10px;border-radius:8px;border:1px solid #e2e8f0">
+          <div><small class="muted">Total Biaya</small><div style="font-weight:700">${money(bill.billedTotal)}</div></div>
+          <div><small class="muted">Sudah Dibayar (${bill.percentPaid}%)</small><div style="font-weight:700;color:#087b4b">${money(bill.paidAmount)}</div></div>
+          <div><small class="muted">Sisa Tagihan</small><div style="font-weight:700;color:${bill.remainingBalance>0?'#b45309':'#087b4b'}">${money(bill.remainingBalance)}</div></div>
+        </div>
         <div style="font-size:13px;background:#f8fafc;padding:10px;border-radius:8px;margin-bottom:10px">
-          ${(enr.payments||[]).map(p=>`<div style="margin-top:4px">• ${esc(p.label||'Pembayaran')}: <b>${money(p.amount)}</b> — <span class="status ${p.status==='confirmed'?'approved':p.status==='rejected'?'rejected':'pending'}">${p.status==='confirmed'?'Terkonfirmasi':p.status==='rejected'?'Ditolak':'Menunggu Verifikasi'}</span>${p.note?` <i>(${esc(p.note)})</i>`:''}</div>`).join('')}
+          ${(enr.payments||[]).map(p=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:5px 0;border-bottom:1px dashed #e2e8f0">
+            <div>
+              • ${esc(p.label||'Pembayaran')} (${p.method==='cash'?'Tunai':'Transfer'}): <b>${money(p.amount)}</b> —
+              <span class="status ${p.status==='confirmed'?'approved':p.status==='rejected'?'rejected':'pending'}">${p.status==='confirmed'?'Sah / Terkonfirmasi':p.status==='rejected'?'Ditolak':'Menunggu Verifikasi'}</span>
+              ${p.receiptNumber?`<br><small style="color:#087b4b">No. Kuitansi: <b>${esc(p.receiptNumber)}</b></small>`:''}
+              ${p.note?` <i>(${esc(p.note)})</i>`:''}
+            </div>
+            ${p.status==='confirmed' && p.receiptNumber
+              ? `<button type="button" class="button small" data-action="open-receipt" data-enr="${esc(enr.id)}" data-pay="${esc(p.id)}">Cetak Kuitansi</button>`
+              : ''
+            }
+          </div>`).join('')}
         </div>
       `:''}
-      ${lunas ? `
+      ${bill.isPaidFull ? `
         <div style="background:#ecfdf5;border:1px solid #a7f3d0;padding:12px;border-radius:10px;color:#065f46">
-          <b>Hasil Evaluasi</b>
+          <b>Hasil Evaluasi & Akses Live Chat Aktif</b>
           <p style="margin:4px 0">Nilai Akhir: <b>${enr.score!==null&&enr.score!==undefined?esc(enr.score):'Belum dinilai'}</b></p>
           ${enr.evaluationNote?`<p style="margin:4px 0;font-size:13px">Catatan: ${esc(enr.evaluationNote)}</p>`:''}
         </div>
       ` : `
         <div style="background:#fffbeb;border:1px solid #fde68a;padding:12px;border-radius:10px;color:#78350f">
-          <b>Nilai Evaluasi & Sertifikat Terkunci</b>
-          <p style="margin:4px 0;font-size:13px">Selesaikan pelunasan biaya untuk membuka nilai evaluasi dan sertifikat.</p>
+          <b>Nilai Evaluasi, Sertifikat & Live Chat Otomatis Terkunci</b>
+          <p style="margin:4px 0;font-size:13px">Selesaikan pelunasan biaya untuk membuka nilai evaluasi, sertifikat, dan akses langsung Live Chat.</p>
           ${hasPending
             ? `<p style="margin:6px 0 0;font-size:13px;font-weight:600">Bukti pembayaran sedang diverifikasi.</p>`
-            : `<button class="button small" style="margin-top:8px;background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(sisa)})</button>`
+            : `<button class="button small" style="margin-top:8px;background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(bill.remainingBalance)})</button>`
           }
         </div>
       `}
@@ -1040,7 +1346,7 @@ function renderCatalog(force=false){
 }
 
 /* ============================================================================
-2. BUKU DIGITAL HTML FULLSCREEN & PEMESANAN BUKU FISIK (PESERTA & ADMIN)
+2. BUKU DIGITAL HTML FULLSCREEN & PEMESANAN BUKU FISIK
    ============================================================================ */
 function renderMemberModules(force=false){
   const root=$('#portal-content');
@@ -1179,6 +1485,181 @@ function renderModuleAdmin(){
 }
 
 /* ============================================================================
+2B. BIMBINGAN UJI KOMPETENSI (UKOM) PERAWAT (PESERTA & ADMIN)
+   ============================================================================ */
+const UKOM_STEPS=[
+  {key:'diagnostik',label:'1. Pre-Test Diagnostik & Pemetaan Kompetensi Keperawatan'},
+  {key:'kmb_gadar',label:'2. Pendalaman Kasus KMB, Gawat Darurat & Kritis'},
+  {key:'anak_maternitas',label:'3. Pendalaman Kasus Anak, Maternitas, Jiwa & Komunitas'},
+  {key:'tryout_cbt',label:'4. Simulasi Tryout CBT Nasional (180 Soal / 180 Menit)'},
+  {key:'siap_ukom',label:'5. Bedah Soal & Kesiapan Ujian Kompetensi (Kompeten)'}
+];
+
+function renderMemberUKOM(force=false){
+  const ukomPrograms=state.programs.filter(p=>p.kind==='ukom'&&HauraFinance.programFee(p)>0);
+  const myUkom=state.enrollments.filter(enr=>{
+    const prog=state.programs.find(p=>p.id===enr.programId);
+    return prog?.kind==='ukom' || enr.kind==='ukom';
+  });
+  if(!shouldRender('ukom', {ukomPrograms, myUkom}, force)) return;
+
+  const myUkomHtml=myUkom.length ? myUkom.map(enr=>{
+    const prog=state.programs.find(p=>p.id===enr.programId);
+    const title=enr.programTitle||prog?.title||'Bimbingan UKOM Perawat';
+    const st=HauraFinance.statusLabel(enr);
+    const bill=HauraFinance.billingBreakdown(enr);
+    const hasPending=bill.pendingPayments.length>0;
+    const chk=enr.ukomChecklist||{};
+
+    return `<article class="card" style="border-left:4px solid #082740">
+      <div class="row spread" style="flex-wrap:wrap;gap:6px">
+        <b>${esc(title)}</b>
+        <span class="status ${st.code}">${esc(st.text)}</span>
+      </div>
+      <p style="margin:6px 0;font-size:13px">
+        Biaya Bimbingan: <b>${money(bill.billedTotal)}</b> · Terbayar: <b style="color:#087b4b">${money(bill.paidAmount)}</b> · Sisa: <b>${money(bill.remainingBalance)}</b>
+      </p>
+      ${!bill.isPaidFull ? `
+        <div style="background:#fffbeb;border:1px solid #fde68a;padding:10px;border-radius:8px;margin-bottom:10px">
+          ${hasPending?'<small><b>Bukti pembayaran sedang diverifikasi.</b></small>':`<button class="button small" style="background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(bill.remainingBalance)})</button>`}
+        </div>
+      ` : ''}
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;padding:12px;border-radius:10px">
+        <div class="row spread" style="margin-bottom:8px;flex-wrap:wrap;gap:6px">
+          <b>Progres Belajar & Tryout UKOM</b>
+          <span class="pill">${esc(enr.ukomStage||'Tahap 1: Pemetaan Materi')}</span>
+        </div>
+        ${enr.score!==null&&enr.score!==undefined?`<p style="margin:0 0 8px;font-size:13.5px;color:#087b4b">Skor Simulasi Tryout CBT Terakhir: <b>${esc(enr.score)}</b></p>`:''}
+        ${UKOM_STEPS.map(step=>{
+          const item=chk[step.key]||{};
+          return `<div style="padding:6px 0;border-bottom:1px solid #e2e8f0;font-size:13px">
+            <div><b>${esc(step.label)}</b> — <span style="color:${item.done?'#087b4b':'#b45309'};font-weight:700">${item.done?'Selesai':'Belum Selesai'}</span></div>
+            ${item.note?`<div class="muted">Catatan: ${esc(item.note)}</div>`:''}
+          </div>`;
+        }).join('')}
+        ${enr.evaluationNote?`<p style="margin:8px 0 0;font-size:13px;color:#065f46"><b>Evaluasi Mentor UKOM:</b> ${esc(enr.evaluationNote)}</p>`:''}
+        <button type="button" class="button small green" style="margin-top:10px" data-action="edit-ukom-progress" data-id="${esc(enr.id)}">Update Progres Belajar UKOM</button>
+      </div>
+    </article>`;
+  }).join('') : empty('Anda belum terdaftar pada kelas Bimbingan UKOM.');
+
+  const pkgHtml=ukomPrograms.map(p=>{
+    const joined=myUkom.some(e=>e.programId===p.id);
+    const fee=HauraFinance.programFee(p), minDp=HauraFinance.programMinDp(p);
+    return `<article class="card">
+      <h3>${esc(p.title)}</h3>
+      <p>${esc(p.description)}</p>
+      <p style="font-size:14px">Biaya Bimbingan: <b>${money(fee)}</b><br>Minimal Daftar: <b>${money(minDp)}</b></p>
+      <button class="button green" data-action="enroll" data-id="${esc(p.id)}" ${joined?'disabled':''}>${joined?'Sudah Terdaftar':'Daftar Bimbingan UKOM'}</button>
+    </article>`;
+  }).join('')||empty('Belum ada paket Bimbingan UKOM tersedia.');
+
+  $('#portal-content').innerHTML=`
+    <h2>Bimbingan Uji Kompetensi (UKOM) Perawat</h2>
+    <div class="stack" style="margin-bottom:24px">${myUkomHtml}</div>
+    <h3 class="section-title">Paket Kelas Bimbingan & Tryout UKOM</h3>
+    <div class="cards">${pkgHtml}</div>
+  `;
+}
+
+function openUkomProgressModal(enrollmentId){
+  const enr=state.enrollments.find(e=>e.id===enrollmentId);
+  if(!enr)throw new Error('Data bimbingan UKOM tidak ditemukan.');
+  const chk=enr.ukomChecklist||{};
+  modal('Progres Belajar & Tryout UKOM',`
+    <form data-form="save-ukom-progress" data-id="${esc(enr.id)}">
+      ${UKOM_STEPS.map(step=>{
+        const item=chk[step.key]||{};
+        return `<div style="padding:10px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:10px">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:700;cursor:pointer">
+            <input type="checkbox" name="done_${step.key}" ${item.done?'checked':''}> ${esc(step.label)}
+          </label>
+          ${field('Catatan / Skor Latihan Mandiri','note_'+step.key,'text',item.note||'','maxlength="300" placeholder="Contoh: Skor Tryout 1 = 68,5%"')}
+        </div>`;
+      }).join('')}
+      ${submit('Simpan Progres UKOM','green')}
+    </form>
+  `);
+}
+
+function renderUKOMAdmin(force=false){
+  const ukomPrograms=state.programs.filter(p=>p.kind==='ukom');
+  const ukomEnrs=state.enrollments.filter(enr=>{
+    const prog=state.programs.find(p=>p.id===enr.programId);
+    return prog?.kind==='ukom' || enr.kind==='ukom';
+  });
+  if(!shouldRender('ukom-admin', {ukomPrograms, ukomEnrs, users: state.users.map(u=>[u.id,u.name,u.fullTitleName,u.phone])}, force)) return;
+
+  $('#portal-content').innerHTML=`
+    <h2>Kelola Bimbingan Uji Kompetensi (UKOM)</h2>
+    <details class="card" style="margin-bottom:18px">
+      <summary style="font-weight:700;cursor:pointer">+ Tambah Paket Bimbingan UKOM</summary>
+      <form data-form="program-ukom" style="margin-top:12px">
+        ${field('Nama Paket Bimbingan UKOM','title','text','','required maxlength="180" placeholder="Contoh: Bimbingan Intensif & Tryout CBT UKOM Ners 2026"')}
+        ${area('Rincian Materi, Jadwal & Fasilitas Tryout','description','','required maxlength="3000"')}
+        ${field('Total Biaya Bimbingan (Rp)','totalFee','number','500000','required min="1000" step="1000"')}
+        ${field('Minimal Bayar Pendaftaran / DP (Rp)','minDownPayment','number','150000','required min="0" step="1000"')}
+        ${submit('Simpan Paket UKOM','green')}
+      </form>
+      <div class="cards" style="margin-top:12px">${ukomPrograms.map(p=>`
+        <article class="card">
+          <b>${esc(p.title)}</b>
+          <p style="font-size:13px">${money(HauraFinance.programFee(p))} (DP: ${money(HauraFinance.programMinDp(p))})</p>
+          <button type="button" class="button small danger" data-action="archive-program" data-id="${esc(p.id)}">Arsipkan</button>
+        </article>
+      `).join('')}</div>
+    </details>
+
+    <h3 class="section-title">Peserta Bimbingan UKOM (${ukomEnrs.length})</h3>
+    <div class="stack">${ukomEnrs.length ? ukomEnrs.map(enr=>{
+      const u=state.users.find(x=>x.id===enr.userId);
+      const st=HauraFinance.statusLabel(enr);
+      const chk=enr.ukomChecklist||{};
+      const doneCount=UKOM_STEPS.filter(s=>chk[s.key]?.done).length;
+      return `<article class="card" style="border-left:4px solid #082740">
+        <div class="row spread" style="flex-wrap:wrap;gap:6px">
+          <div>
+            <b>${esc(u?.fullTitleName||u?.name||enr.userId)}</b> <small class="muted">(${esc(u?.phone||'-')})</small><br>
+            <small style="color:#087b4b;font-weight:600">${esc(enr.programTitle||'Bimbingan UKOM')}</small>
+          </div>
+          <span class="status ${st.code}">${esc(st.text)}</span>
+        </div>
+        <p style="font-size:13px;margin:8px 0">
+          Tahap: <b>${esc(enr.ukomStage||'Tahap 1: Pemetaan Materi')}</b> · Progres: <b>${doneCount}/${UKOM_STEPS.length}</b> · Skor Tryout: <b>${enr.score!==null&&enr.score!==undefined?esc(enr.score):'-'}</b>
+        </p>
+        <div style="font-size:12.5px;background:#f8fafc;padding:8px;border-radius:8px;margin-bottom:10px">
+          ${UKOM_STEPS.map(s=>`<div>${chk[s.key]?.done?'✅':'⬜'} ${esc(s.label)} ${chk[s.key]?.note?`<i>(${esc(chk[s.key].note)})</i>`:''}</div>`).join('')}
+        </div>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button type="button" class="button small green" data-action="review-ukom" data-id="${esc(enr.id)}">Update Tahap & Mentor UKOM</button>
+          <button type="button" class="button small" data-action="grade-enrollment" data-id="${esc(enr.id)}">Input Skor Tryout CBT</button>
+        </div>
+      </article>`;
+    }).join('') : empty('Belum ada peserta Bimbingan UKOM.')}</div>
+  `;
+}
+
+function openReviewUkomModal(enrollmentId){
+  const enr=state.enrollments.find(e=>e.id===enrollmentId);
+  if(!enr)throw new Error('Data tidak ditemukan.');
+  const u=state.users.find(x=>x.id===enr.userId);
+  modal('Update Progres Bimbingan UKOM',`
+    <p>Peserta: <b>${esc(u?.fullTitleName||u?.name||enr.userId)}</b></p>
+    <form data-form="save-ukom-review" data-id="${esc(enr.id)}">
+      <div class="field"><label for="ukom-stage">Tahap Bimbingan</label><select id="ukom-stage" name="ukomStage">
+        <option ${enr.ukomStage==='Tahap 1: Pemetaan Materi'?'selected':''}>Tahap 1: Pemetaan Materi</option>
+        <option ${enr.ukomStage==='Tahap 2: Pendalaman Kasus Klinis'?'selected':''}>Tahap 2: Pendalaman Kasus Klinis</option>
+        <option ${enr.ukomStage==='Tahap 3: Tryout CBT & Bedah Soal'?'selected':''}>Tahap 3: Tryout CBT & Bedah Soal</option>
+        <option ${enr.ukomStage==='Siap Ujian Kompetensi Nasional'?'selected':''}>Siap Ujian Kompetensi Nasional</option>
+        <option ${enr.ukomStage==='Lulus Kompeten'?'selected':''}>Lulus Kompeten</option>
+      </select></div>
+      ${area('Evaluasi / Rekomendasi Mentor UKOM', 'evaluationNote', enr.evaluationNote||'', 'maxlength="1000"')}
+      ${submit('Simpan Progres UKOM','green')}
+    </form>
+  `);
+}
+
+/* ============================================================================
 3. BIMBINGAN PENGAJUAN PRAKTIK MANDIRI KEPERAWATAN (PMK)
    ============================================================================ */
 const PMK_STEPS=[
@@ -1201,9 +1682,8 @@ function renderMemberPMK(force=false){
     const prog=state.programs.find(p=>p.id===enr.programId);
     const title=enr.programTitle||prog?.title||'Bimbingan Praktik Mandiri Keperawatan';
     const st=HauraFinance.statusLabel(enr);
-    const lunas=HauraFinance.isPaidFull(enr);
-    const sisa=HauraFinance.remainingBalance(enr);
-    const hasPending=(enr.payments||[]).some(p=>p.status==='pending');
+    const bill=HauraFinance.billingBreakdown(enr);
+    const hasPending=bill.pendingPayments.length>0;
     const chk=enr.pmkChecklist||{};
 
     return `<article class="card" style="border-left:4px solid #087b4b">
@@ -1212,11 +1692,11 @@ function renderMemberPMK(force=false){
         <span class="status ${st.code}">${esc(st.text)}</span>
       </div>
       <p style="margin:6px 0;font-size:13px">
-        Biaya Bimbingan: <b>${money(enr.billedTotal)}</b> · Terkonfirmasi: <b style="color:#087b4b">${money(enr.paidAmount)}</b> · Sisa: <b>${money(sisa)}</b>
+        Biaya Bimbingan: <b>${money(bill.billedTotal)}</b> · Terkonfirmasi: <b style="color:#087b4b">${money(bill.paidAmount)}</b> · Sisa: <b>${money(bill.remainingBalance)}</b>
       </p>
-      ${!lunas ? `
+      ${!bill.isPaidFull ? `
         <div style="background:#fffbeb;border:1px solid #fde68a;padding:10px;border-radius:8px;margin-bottom:10px">
-          ${hasPending?'<small><b>Bukti pembayaran sedang diverifikasi.</b></small>':`<button class="button small" style="background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(sisa)})</button>`}
+          ${hasPending?'<small><b>Bukti pembayaran sedang diverifikasi.</b></small>':`<button class="button small" style="background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(bill.remainingBalance)})</button>`}
         </div>
       ` : ''}
       <div style="background:#f8fafc;border:1px solid #e2e8f0;padding:12px;border-radius:10px">
@@ -1703,16 +2183,17 @@ function openInstallmentModal(enrollmentId){
 }
 
 /* ============================================================================
-7. DISKUSI SBAR BERLANGGANAN (QRIS) & PEMESANAN ALKES (PESERTA)
+7. DISKUSI SBAR (OTOMATIS AKTIF JIKA LUNAS PROGRAM / LANGGANAN) & ALKES
    ============================================================================ */
 function renderMemberChatAndAlkes(force=false){
   const root=$('#portal-content');
-  if(chatSubTab==='consult' && profile?.chatAccess && $('#messages') && !force){
+  const canChat = hasEffectiveChatAccess();
+  if(chatSubTab==='consult' && canChat && $('#messages') && !force){
     return;
   }
   const sig = JSON.stringify({
     chatSubTab,
-    chatAccess: Boolean(profile?.chatAccess),
+    canChat,
     alkes: state.alkes.filter(a=>!a.kind||a.kind==='alkes'),
     alkesCart,
     alkesOrders: state.alkesOrders,
@@ -1789,7 +2270,7 @@ function renderMemberChatAndAlkes(force=false){
     return;
   }
 
-  if(profile.chatAccess){
+  if(canChat){
     if(!$('#messages')){
       root.innerHTML=`${switcher}<h2>Diskusi Klinis (SBAR)</h2><div id="chat-host"></div>`;
       createRoom(me.uid,'Tim Konsultan Haura Institute');
@@ -1806,8 +2287,11 @@ function renderMemberChatAndAlkes(force=false){
   root.innerHTML=`
     ${switcher}
     <h2>Paket Langganan Diskusi Klinis (SBAR)</h2>
+    <div style="background:#ecfdf5;border:1px solid #a7f3d0;padding:12px;border-radius:10px;margin-bottom:14px;color:#065f46;font-size:13.5px">
+      <b>Info Otomatis:</b> Jika Anda telah melunasi salah satu program pelatihan / UKOM / PMK, akses Live Chat SBAR terbuka otomatis tanpa biaya tambahan.
+    </div>
     <div class="card" style="border-left:4px solid #087b4b">
-      <p style="font-size:16px;margin:0 0 8px">Biaya Langganan: <b style="color:#087b4b">${money(fee)}</b> · Masa Aktif: <b>${esc(dur)}</b></p>
+      <p style="font-size:16px;margin:0 0 8px">Biaya Langganan Khusus Diskusi: <b style="color:#087b4b">${money(fee)}</b> · Masa Aktif: <b>${esc(dur)}</b></p>
       ${pendingSub
         ? `<p><span class="status pending">Menunggu Verifikasi Pembayaran</span></p>`
         : `
@@ -1826,23 +2310,24 @@ function renderMemberChatAndAlkes(force=false){
 }
 
 /* ============================================================================
-8. ADMIN: KEUANGAN, QRIS, ALKES & PESERTA / ANGKATAN
+8. ADMIN: KEUANGAN, BAYAR TUNAI, KUITANSI, PAKET AKSES, QRIS & ALKES
    ============================================================================ */
 function renderFinanceAdmin(force=false){
   const sig = JSON.stringify({
     financeFilterProgram,
     enrollments: state.enrollments,
     chatPayments: state.chatPayments,
+    accessPayments: state.accessPayments,
     alkesOrders: state.alkesOrders,
     expenses: state.expenses,
     alkes: state.alkes,
     programs: state.programs.map(p=>[p.id,p.title]),
-    users: state.users.map(u=>[u.id,u.name,u.fullTitleName,u.institution]),
-    cms: {q:state.cms.qrisPath,p:state.cms.paymentInfo,f:state.cms.chatFee,d:state.cms.chatDurationLabel}
+    users: state.users.map(u=>[u.id,u.name,u.fullTitleName,u.institution,u.accessStatus,u.accessExpiresAtMs]),
+    cms: {q:state.cms.qrisPath,p:state.cms.paymentInfo,f:state.cms.chatFee,d:state.cms.chatDurationLabel,sg:state.cms.subscriptionGate}
   });
   if(!shouldRender('finance', sig, force)) return;
 
-  const recap=HauraFinance.calculateRecap(state.enrollments, state.chatPayments, state.alkesOrders, state.expenses, financeFilterProgram);
+  const recap=HauraFinance.calculateRecap(state.enrollments, state.chatPayments, state.alkesOrders, state.expenses, financeFilterProgram, state.accessPayments);
   const programOptions=`<option value="ALL" ${financeFilterProgram==='ALL'?'selected':''}>Semua Pemasukan & Program</option>`+
     state.programs.map(p=>`<option value="${esc(p.id)}" ${financeFilterProgram===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
 
@@ -1859,23 +2344,26 @@ function renderFinanceAdmin(force=false){
     const u=state.users.find(x=>x.id===enr.userId);
     const prog=state.programs.find(x=>x.id===enr.programId);
     const st=HauraFinance.statusLabel(enr);
-    const sisa=HauraFinance.remainingBalance(enr);
-    const lunas=HauraFinance.isPaidFull(enr);
+    const bill=HauraFinance.billingBreakdown(enr);
 
     const payRows=(enr.payments||[]).map(p=>`
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;margin-top:6px">
         <div>
-          <b>${esc(p.label||'Pembayaran')}</b>: ${money(p.amount)}<br>
+          <b>${esc(p.label||'Pembayaran')}</b> (${p.method==='cash'?'Tunai / Cash':'Transfer'}): ${money(p.amount)}<br>
           <small class="muted">${date(p.submittedAt)}</small>
+          ${p.receiptNumber?`<br><small style="color:#087b4b">Kuitansi: <b>${esc(p.receiptNumber)}</b></small>`:''}
         </div>
-        <div class="row" style="gap:6px">
+        <div class="row" style="gap:6px;flex-wrap:wrap">
           <span class="status ${p.status==='confirmed'?'approved':p.status==='rejected'?'rejected':'pending'}">${p.status==='confirmed'?'Terkonfirmasi':p.status==='rejected'?'Ditolak':'Pending'}</span>
-          <button class="button small" data-action="review-payment" data-enr="${esc(enr.id)}" data-pay="${esc(p.id)}">Periksa Bukti</button>
+          ${p.status==='confirmed' && p.receiptNumber
+            ? `<button type="button" class="button small green" data-action="open-receipt" data-enr="${esc(enr.id)}" data-pay="${esc(p.id)}">Kuitansi</button>`
+            : `<button type="button" class="button small" data-action="review-payment" data-enr="${esc(enr.id)}" data-pay="${esc(p.id)}">Periksa Bukti</button>`
+          }
         </div>
       </div>
     `).join('');
 
-    return `<article class="card" style="border-left:4px solid ${lunas?'#087b4b':'#d97706'}">
+    return `<article class="card" style="border-left:4px solid ${bill.isPaidFull?'#087b4b':'#d97706'}">
       <div class="row spread" style="flex-wrap:wrap;gap:6px">
         <div>
           <b>${esc(u?.fullTitleName||u?.name||enr.userId)}</b> <small class="muted">(${esc(u?.institution||'-')})</small><br>
@@ -1884,17 +2372,37 @@ function renderFinanceAdmin(force=false){
         <span class="status ${st.code}">${esc(st.text)}</span>
       </div>
       <p style="margin:8px 0;font-size:13px">
-        Tagihan: <b>${money(enr.billedTotal)}</b> ·
-        Masuk Kas: <b style="color:#087b4b">${money(enr.paidAmount)}</b> ·
-        Sisa: <b style="color:${sisa>0?'#b45309':'#087b4b'}">${money(sisa)}</b> ·
+        Total Biaya: <b>${money(bill.billedTotal)}</b> ·
+        Terbayar: <b style="color:#087b4b">${money(bill.paidAmount)} (${bill.percentPaid}%)</b> ·
+        Sisa Tagihan: <b style="color:${bill.remainingBalance>0?'#b45309':'#087b4b'}">${money(bill.remainingBalance)}</b> ·
         Nilai: <b>${enr.score!==null&&enr.score!==undefined?esc(enr.score):'-'}</b>
       </p>
       <div style="background:#f8fafc;padding:8px;border-radius:8px;margin-bottom:10px">
-        ${payRows||'<p class="muted">Belum ada bukti.</p>'}
+        ${payRows||'<p class="muted">Belum ada catatan pembayaran.</p>'}
       </div>
-      <button class="button small green" data-action="grade-enrollment" data-id="${esc(enr.id)}">Input Nilai Evaluasi</button>
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        ${bill.remainingBalance>0 ? `<button type="button" class="button small" style="background:#0d9488" data-action="cash-payment-modal" data-id="${esc(enr.id)}">+ Terima Bayar Tunai (Cash)</button>` : ''}
+        <button type="button" class="button small green" data-action="grade-enrollment" data-id="${esc(enr.id)}">Input Nilai Evaluasi</button>
+      </div>
     </article>`;
   }).join('') : empty('Belum ada peserta pada filter ini.');
+
+  const accessPayCards=state.accessPayments.length ? state.accessPayments.map(ap=>{
+    const u=state.users.find(x=>x.id===ap.userId);
+    return `<article class="card" style="border-left:4px solid ${ap.status==='confirmed'?'#087b4b':'#d97706'}">
+      <div class="row spread" style="flex-wrap:wrap;gap:6px">
+        <div>
+          <b>${esc(u?.fullTitleName||u?.name||ap.userId)}</b> · <b style="color:#087b4b">${money(ap.amount)}</b> (${esc(ap.packageName||'Paket Akses')} · ${ap.durationDays||365} hari)<br>
+          <small class="muted">${date(ap.createdAt)}</small>
+          ${ap.receiptNumber?` · <small style="color:#087b4b">Kuitansi: <b>${esc(ap.receiptNumber)}</b></small>`:''}
+        </div>
+        <div class="row" style="gap:6px">
+          <span class="status ${ap.status==='confirmed'?'approved':ap.status==='rejected'?'rejected':'pending'}">${ap.status==='confirmed'?'Aktif':'Pending'}</span>
+          <button class="button small" data-action="review-access-pay" data-id="${esc(ap.id)}">Periksa Bukti</button>
+        </div>
+      </div>
+    </article>`;
+  }).join('') : empty('Belum ada pengajuan pembayaran paket akses portal.');
 
   const chatPayCards=state.chatPayments.length ? state.chatPayments.map(cp=>{
     const u=state.users.find(x=>x.id===cp.userId);
@@ -1941,21 +2449,40 @@ function renderFinanceAdmin(force=false){
   }).join('') : empty('Belum ada catatan pengeluaran.');
 
   const regularAlkes=state.alkes.filter(a=>!a.kind||a.kind==='alkes');
+  const gate = state.cms.subscriptionGate || {enabled:false,price:50000,durationDays:365,packageName:'Akses Portal & Modul 1 Tahun'};
 
   $('#portal-content').innerHTML=`
     <div class="row spread" style="flex-wrap:wrap;gap:10px;margin-bottom:14px">
-      <h2 style="margin:0">Keuangan, QRIS, Produk & Evaluasi</h2>
-      <div class="field" style="margin:0;min-width:240px">
-        <select id="finance-filter">${programOptions}</select>
+      <h2 style="margin:0">Keuangan, Tunai, Kuitansi, Paket Akses & Evaluasi</h2>
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <button type="button" class="button small green" data-action="direct-cash-enroll-modal">+ Daftar & Bayar Tunai Peserta</button>
+        <div class="field" style="margin:0;min-width:220px">
+          <select id="finance-filter">${programOptions}</select>
+        </div>
       </div>
     </div>
 
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:18px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px;margin-bottom:18px">
       <div class="card" style="padding:12px"><small class="muted">Peserta (Daftar / DP / Lunas)</small><div style="font-size:18px;font-weight:700;margin-top:4px">${recap.totalSubmissions} / ${recap.confirmedDpCount} / ${recap.paidFullCount}</div><small class="muted">Bukti menunggu: <b>${recap.pendingProofCount}</b></small></div>
-      <div class="card" style="padding:12px"><small class="muted">Kas Masuk Terkonfirmasi</small><div style="font-size:18px;font-weight:700;color:#087b4b;margin-top:4px">${money(recap.confirmedCashIn)}</div><small class="muted">Program/PMK: ${money(recap.programCashIn)} · Diskusi: ${money(recap.chatCashIn)} · Alkes/Buku/Baju: ${money(recap.alkesCashIn)}</small></div>
+      <div class="card" style="padding:12px"><small class="muted">Kas Masuk Terkonfirmasi</small><div style="font-size:18px;font-weight:700;color:#087b4b;margin-top:4px">${money(recap.confirmedCashIn)}</div><small class="muted">Tunai: ${money(recap.cashMethodIn)} · Transfer: ${money(recap.transferMethodIn)}</small><br><small class="muted">Akses: ${money(recap.accessCashIn)} · Diskusi: ${money(recap.chatCashIn)} · Produk: ${money(recap.alkesCashIn)}</small></div>
       <div class="card" style="padding:12px"><small class="muted">Total Pengeluaran</small><div style="font-size:18px;font-weight:700;color:#9f1734;margin-top:4px">${money(recap.totalExpense)}</div><small class="muted">BMHP: ${money(recap.bmhp)} · Alkes: ${money(recap.alkes)}</small></div>
-      <div class="card" style="padding:12px;background:#f0fdf4;border:1px solid #86efac"><small style="color:#166534;font-weight:600">Kas Bersih</small><div style="font-size:20px;font-weight:800;color:#14532d;margin-top:4px">${money(recap.netCash)}</div><small class="muted">Sisa piutang: <b>${money(recap.remainingReceivables)}</b></small></div>
+      <div class="card" style="padding:12px;background:#f0fdf4;border:1px solid #86efac"><small style="color:#166534;font-weight:600">Kas Bersih</small><div style="font-size:20px;font-weight:800;color:#14532d;margin-top:4px">${money(recap.netCash)}</div><small class="muted">Sisa piutang peserta: <b>${money(recap.remainingReceivables)}</b></small></div>
     </div>
+
+    <details class="card" style="margin-bottom:14px">
+      <summary style="font-weight:700;cursor:pointer">Pengaturan Paket Akses Portal Berbayar (${gate.enabled?'AKTIF':'NONAKTIF'})</summary>
+      <form data-form="subscription-gate-config" style="margin-top:12px">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:10px;cursor:pointer">
+          <input type="checkbox" name="enabled" ${gate.enabled?'checked':''}> Aktifkan Pembatasan Akses Berbayar (Peserta wajib berlangganan agar dapat masuk ke aplikasi)
+        </label>
+        ${field('Nama Paket Langganan','packageName','text',gate.packageName||'Akses Portal & Modul 1 Tahun','required maxlength="120"')}
+        <div class="row" style="gap:10px;flex-wrap:wrap">
+          <div style="flex:1;min-width:160px">${field('Harga Paket (Rp)','price','number',String(gate.price||50000),'required min="1000" step="1000"')}</div>
+          <div style="flex:1;min-width:160px">${field('Masa Aktif (Hari — 365 = 1 Tahun, 30 = 1 Bulan)','durationDays','number',String(gate.durationDays||365),'required min="1" max="3650"')}</div>
+        </div>
+        ${submit('Simpan Pengaturan Paket Akses','green')}
+      </form>
+    </details>
 
     <details class="card" style="margin-bottom:14px">
       <summary style="font-weight:700;cursor:pointer">Pengaturan QRIS, Rekening & Paket Diskusi</summary>
@@ -2002,6 +2529,9 @@ function renderFinanceAdmin(force=false){
     </details>
 
     ${financeFilterProgram==='ALL' ? `
+      <h3 class="section-title">Verifikasi Paket Akses Portal (${state.accessPayments.filter(x=>x.status==='pending').length} Pending)</h3>
+      <div class="stack" style="margin-bottom:18px">${accessPayCards}</div>
+
       <h3 class="section-title">Verifikasi Langganan Diskusi SBAR (${state.chatPayments.filter(x=>x.status==='pending').length} Pending)</h3>
       <div class="stack" style="margin-bottom:18px">${chatPayCards}</div>
 
@@ -2009,9 +2539,41 @@ function renderFinanceAdmin(force=false){
       <div class="stack" style="margin-bottom:18px">${alkesOrderCards}</div>
     ` : ''}
 
-    <h3 class="section-title">Verifikasi Pembayaran Pelatihan & PMK</h3>
+    <h3 class="section-title">Verifikasi Pembayaran Pelatihan, UKOM & PMK (Transfer & Tunai)</h3>
     <div class="stack">${enrollmentCards}</div>
   `;
+}
+
+function openCashPaymentModal(enrollmentId){
+  const enr=state.enrollments.find(e=>e.id===enrollmentId);
+  if(!enr)throw new Error('Data pendaftaran tidak ditemukan.');
+  const u=state.users.find(x=>x.id===enr.userId);
+  const bill=HauraFinance.billingBreakdown(enr);
+  modal('Terima Pembayaran Tunai (Cash)',`
+    <p>Peserta: <b>${esc(u?.fullTitleName||u?.name||enr.userId)}</b><br>Program: <b>${esc(enr.programTitle||'Program')}</b></p>
+    <p style="font-size:13.5px">Total Biaya: <b>${money(bill.billedTotal)}</b> · Terbayar: <b>${money(bill.paidAmount)}</b> · Sisa: <b style="color:#b45309">${money(bill.remainingBalance)}</b></p>
+    <form data-form="record-cash-payment" data-enr="${esc(enr.id)}">
+      ${field('Nominal Uang Tunai Diterima (Rp)','amount','number',String(bill.remainingBalance),`required min="1000" max="${bill.remainingBalance}" step="1000"`)}
+      ${field('Catatan Kuitansi (opsional)','note','text','Pembayaran tunai diterima langsung','maxlength="300"')}
+      ${submit('Simpan & Terbitkan Kuitansi Tunai','green')}
+    </form>
+  `);
+}
+
+function openDirectCashEnrollModal(){
+  const progs=state.programs.filter(p=>HauraFinance.programFee(p)>0);
+  modal('Daftarkan & Terima Bayar Tunai Peserta',`
+    <form data-form="direct-cash-enroll">
+      <div class="field"><label for="dce-user">Pilih Peserta</label><select id="dce-user" name="userId" required>${userOptions(false)}</select></div>
+      <div class="field"><label for="dce-prog">Pilih Program / UKOM / PMK</label><select id="dce-prog" name="programId" required>
+        <option value="">— Pilih Program —</option>
+        ${progs.map(p=>`<option value="${esc(p.id)}">${esc(p.title)} (${money(HauraFinance.programFee(p))})</option>`).join('')}
+      </select></div>
+      ${field('Nominal Tunai Diterima (Rp)','amount','number','','required min="1000" step="1000"')}
+      ${field('Catatan Kuitansi','note','text','Pendaftaran & pembayaran tunai langsung','maxlength="300"')}
+      ${submit('Simpan & Terbitkan Kuitansi','green')}
+    </form>
+  `);
 }
 
 function openReviewPaymentModal(enrollmentId,paymentId){
@@ -2021,11 +2583,26 @@ function openReviewPaymentModal(enrollmentId,paymentId){
   const u=state.users.find(x=>x.id===enr.userId);
   modal('Verifikasi Pembayaran',`
     <p>Peserta: <b>${esc(u?.fullTitleName||u?.name||enr.userId)}</b> · Nominal: <b style="color:#087b4b">${money(pay.amount)}</b></p>
-    <div style="text-align:center;margin:10px 0"><img src="./assets/logo.png" data-file="${esc(pay.proofPath)}" alt="Bukti" style="max-width:100%;max-height:360px;border-radius:8px;border:1px solid #cbd5e1"></div>
+    ${pay.proofPath?`<div style="text-align:center;margin:10px 0"><img src="./assets/logo.png" data-file="${esc(pay.proofPath)}" alt="Bukti" style="max-width:100%;max-height:360px;border-radius:8px;border:1px solid #cbd5e1"></div>`:''}
     ${field('Catatan Admin','reviewNote','text',pay.note||'','maxlength="300"')}
     <div class="row" style="gap:8px;margin-top:12px">
-      <button class="button green" data-action="confirm-payment" data-enr="${esc(enr.id)}" data-pay="${esc(pay.id)}">Konfirmasi Sah</button>
+      <button class="button green" data-action="confirm-payment" data-enr="${esc(enr.id)}" data-pay="${esc(pay.id)}">Konfirmasi Sah & Terbitkan Kuitansi</button>
       <button class="button danger" data-action="reject-payment" data-enr="${esc(enr.id)}" data-pay="${esc(pay.id)}">Tolak Bukti</button>
+    </div>
+  `);
+}
+
+function openReviewAccessPayModal(paymentId){
+  const ap=state.accessPayments.find(x=>x.id===paymentId);
+  if(!ap)throw new Error('Data tidak ditemukan.');
+  const u=state.users.find(x=>x.id===ap.userId);
+  modal('Verifikasi Paket Akses Portal',`
+    <p>Peserta: <b>${esc(u?.fullTitleName||u?.name||ap.userId)}</b> · Nominal: <b style="color:#087b4b">${money(ap.amount)}</b> (${ap.durationDays||365} hari)</p>
+    <div style="text-align:center;margin:10px 0"><img src="./assets/logo.png" data-file="${esc(ap.proofPath)}" alt="Bukti" style="max-width:100%;max-height:360px;border-radius:8px;border:1px solid #cbd5e1"></div>
+    ${field('Catatan Admin','reviewNote','text',ap.note||'','maxlength="300"')}
+    <div class="row" style="gap:8px;margin-top:12px">
+      <button class="button green" data-action="confirm-access-pay" data-id="${esc(ap.id)}">Konfirmasi & Aktifkan Masa Berlaku</button>
+      <button class="button danger" data-action="reject-access-pay" data-id="${esc(ap.id)}">Tolak</button>
     </div>
   `);
 }
@@ -2066,10 +2643,10 @@ function openGradeModal(enrollmentId){
   const enr=state.enrollments.find(e=>e.id===enrollmentId);
   if(!enr)throw new Error('Data peserta tidak ditemukan.');
   const u=state.users.find(x=>x.id===enr.userId);
-  modal('Nilai Evaluasi Peserta',`
+  modal('Nilai Evaluasi / Skor Tryout Peserta',`
     <p><b>${esc(u?.fullTitleName||u?.name||enr.userId)}</b> · ${esc(enr.programTitle||'Program')}</p>
     <form data-form="save-grade" data-id="${esc(enr.id)}">
-      ${field('Nilai Evaluasi Akhir (0 – 100)','score','number',enr.score!==null&&enr.score!==undefined?String(enr.score):'','min="0" max="100" step="0.1"')}
+      ${field('Nilai Evaluasi / Skor Akhir (0 – 100)','score','number',enr.score!==null&&enr.score!==undefined?String(enr.score):'','min="0" max="100" step="0.1"')}
       ${area('Catatan Evaluasi','evaluationNote',enr.evaluationNote||'','maxlength="1000"')}
       ${submit('Simpan Nilai','green')}
     </form>
@@ -2084,7 +2661,7 @@ function renderValidation(force=false){
 
   $('#portal-content').innerHTML=`
     <div class="row spread" style="flex-wrap:wrap;gap:10px;margin-bottom:14px">
-      <h2 style="margin:0">Kelola Peserta, Biodata & Angkatan</h2>
+      <h2 style="margin:0">Kelola Peserta, Biodata, Akses & Angkatan</h2>
       <div class="field" style="margin:0;min-width:220px">
         <select id="val-batch-filter">
           <option value="ALL">Semua Angkatan / Kelas (${allUsers.length})</option>
@@ -2100,8 +2677,10 @@ function renderValidation(force=false){
       </form>
     </div>
 
-    <div class="cards">${list.map(u=>`
-      <article class="card">
+    <div class="cards">${list.map(u=>{
+      const exp = Number(u.accessExpiresAtMs || 0);
+      const activeSub = u.accessStatus === 'active' && exp > getTrustedTimeMs();
+      return `<article class="card">
         <div class="row spread" style="align-items:start">
           <div class="row" style="gap:10px">
             <input type="checkbox" class="user-batch-pick" value="${esc(u.id)}" style="margin-top:6px">
@@ -2109,6 +2688,7 @@ function renderValidation(force=false){
             <div>
               <b>${esc(u.fullTitleName||u.name)}</b><br>
               <span class="pill" style="font-size:11px">${esc(u.batch||'Belum diatur angkatan')}</span>
+              ${activeSub?`<span class="pill" style="font-size:11px;background:#dcfce7;color:#166534">Akses s/d ${new Date(exp).toLocaleDateString('id-ID')}</span>`:''}
               <p style="font-size:13px;margin:4px 0">${esc(u.email)}<br>${esc(u.institution||'-')}${u.phone?` · WA: ${esc(u.phone)}`:''}</p>
             </div>
           </div>
@@ -2117,30 +2697,101 @@ function renderValidation(force=false){
         <div class="row" style="gap:6px;flex-wrap:wrap">
           <button class="button green small" data-action="approve-user" data-id="${esc(u.id)}">Aktifkan</button>
           <button class="button danger small" data-action="reject-user" data-id="${esc(u.id)}">Nonaktifkan</button>
+          <button class="button small" data-action="admin-grant-access" data-id="${esc(u.id)}">Set Masa Akses</button>
           <button class="button small" data-action="admin-edit-biodata" data-id="${esc(u.id)}">Biodata</button>
           <button class="button small" data-action="admin-id-card" data-id="${esc(u.id)}">ID Card</button>
           <button class="button small" data-action="reset-member" data-id="${esc(u.id)}">Reset Password</button>
         </div>
-      </article>
-    `).join('')||empty('Belum ada peserta.')}</div>
+      </article>`;
+    }).join('')||empty('Belum ada peserta.')}</div>
   `;
   hydrate();
 }
 
+function openGrantAccessModal(userId){
+  const u=state.users.find(x=>x.id===userId);
+  if(!u)throw new Error('Peserta tidak ditemukan.');
+  modal('Atur Masa Aktif Paket Akses Peserta',`
+    <p>Peserta: <b>${esc(u.fullTitleName||u.name||u.id)}</b></p>
+    <form data-form="admin-set-access" data-uid="${esc(u.id)}">
+      ${field('Tambah / Set Masa Aktif (Hari — 365 = 1 Tahun, 0 = Nonaktifkan)','durationDays','number','365','required min="0" max="3650"')}
+      ${submit('Simpan Masa Aktif','green')}
+    </form>
+  `);
+}
+
+/* ============================================================================
+9. CMS BERANDA, GALERI BANNER ATAS, VIDEO AUTOPLAY & KELOLA CELENGAN AMAL
+   ============================================================================ */
 function renderCMS(){
   const c=state.cms;
   const regularPrograms=state.programs.filter(p=>!p.kind||p.kind==='training');
+  const banners=Array.isArray(c.banners)?c.banners:[];
+  const ch=c.charity||{enabled:true,title:'Celengan Amal Haura Institute',description:'',totalCollected:0,totalDistributed:0};
+  const chRecap=HauraFinance.calculateCharityRecap(state.donations, ch);
+
   $('#portal-content').innerHTML=`
-    <h2>Pengaturan Beranda, Video, Logo & Program</h2>
+    <h2>Pengaturan Beranda, Galeri Banner, Celengan Amal & Program</h2>
+
+    <details class="card" style="margin-bottom:16px" open>
+      <summary style="font-weight:700;cursor:pointer">Galeri Foto Banner Atas Beranda (${banners.length} Foto)</summary>
+      <form data-form="add-banner" style="margin-top:12px">
+        ${field('Upload Foto Kegiatan / Banner (JPG/PNG/WebP — ukuran menyesuaikan otomatis)','bannerFile','file','','required accept="image/jpeg,image/png,image/webp"')}
+        ${field('Judul Singkat Slide (opsional)','title','text','','maxlength="120"')}
+        ${field('Keterangan Singkat (opsional)','caption','text','','maxlength="220"')}
+        ${submit('Tambahkan ke Galeri Banner','green')}
+      </form>
+      <div class="cards" style="margin-top:12px">${banners.map((b,i)=>`
+        <article class="card">
+          <img src="./assets/logo.png" data-file="${esc(b.imagePath)}" alt="${esc(b.title||'Banner')}" style="width:100%;height:120px;object-fit:contain;background:#082740;border-radius:8px;margin-bottom:6px">
+          <b>${esc(b.title||`Slide #${i+1}`)}</b>
+          <p style="font-size:12.5px;margin:4px 0">${esc(b.caption||'')}</p>
+          <button type="button" class="button small danger" data-action="remove-banner" data-id="${esc(b.id)}">Hapus Foto</button>
+        </article>
+      `).join('')||empty('Belum ada foto banner atas.')}</div>
+    </details>
+
+    <details class="card" style="margin-bottom:16px">
+      <summary style="font-weight:700;cursor:pointer">Kelola Celengan Amal & Penyaluran Sosial (Saldo: ${money(chRecap.balance)})</summary>
+      <form data-form="charity-config" style="margin-top:12px">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:10px;cursor:pointer">
+          <input type="checkbox" name="enabled" ${ch.enabled!==false?'checked':''}> Tampilkan Celengan Amal di Halaman Beranda
+        </label>
+        ${field('Judul Celengan Amal','title','text',ch.title||'Celengan Amal Haura Institute','required maxlength="140"')}
+        ${area('Deskripsi Program Amal','description',ch.description||'','maxlength="600"')}
+        ${submit('Simpan Pengaturan Amal','green')}
+      </form>
+      <hr style="margin:14px 0;border:0;border-top:1px solid #e2e8f0">
+      <form data-form="distribute-charity">
+        <b>Catat Penyaluran Dana Amal</b>
+        ${field('Nominal Disalurkan (Rp)','amount','number','','required min="1000" step="1000"')}
+        ${field('Tujuan / Penerima Manfaat Penyaluran','distributionTarget','text','','required maxlength="220" placeholder="Contoh: Santunan Anak Yatim & Bakti Sosial Desa Bagu"')}
+        ${submit('Catat Penyaluran Amal')}
+      </form>
+      <div style="margin-top:14px">
+        <b>Konfirmasi Donasi Masuk (${state.donations.filter(d=>d.status==='pending').length} Pending):</b>
+        ${state.donations.map(d=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #e2e8f0;flex-wrap:wrap">
+            <div>
+              <b>${esc(d.donorName||'Hamba Allah')}</b> · <b style="color:${d.status==='distributed'?'#9f1734':'#087b4b'}">${money(d.amount)}</b>
+              <span class="status ${d.status==='confirmed'||d.status==='distributed'?'approved':d.status==='rejected'?'rejected':'pending'}">${d.status==='distributed'?'Tersalurkan':d.status==='confirmed'?'Terkonfirmasi':d.status==='rejected'?'Ditolak':'Pending'}</span>
+              ${d.note||d.distributionTarget?`<br><small class="muted">${esc(d.distributionTarget||d.note)}</small>`:''}
+            </div>
+            ${d.status==='pending'?`<button type="button" class="button small" data-action="review-donation" data-id="${esc(d.id)}">Periksa Bukti</button>`:''}
+          </div>
+        `).join('')||empty('Belum ada transaksi amal.')}
+      </div>
+    </details>
+
     <form data-form="cms" class="card">
       ${field('Nama Brand','logoText','text',c.logoText,'required maxlength="30"')}
       ${c.logoPath?`<div style="margin:8px 0"><img src="./assets/logo.png" data-file="${esc(c.logoPath)}" alt="Logo" style="width:72px;height:72px;object-fit:contain;border:1px solid #cbd5e1;border-radius:8px;padding:4px"><br><button type="button" class="button small danger" data-action="reset-logo" style="margin-top:6px">Kembalikan Logo Default</button></div>`:''}
       ${field('Ganti Logo Institusi (PNG/JPG/WebP)','logoFile','file','','accept="image/jpeg,image/png,image/webp"')}
       ${field('Judul Beranda','welcomeTitle','text',c.welcomeTitle,'required maxlength="180"')}
       ${area('Subjudul Beranda','welcomeText',c.welcomeText,'required maxlength="2000"')}
-      ${c.videoPath?`<div style="margin:8px 0"><small class="muted">Video terunggah aktif.</small> <button type="button" class="button small danger" data-action="remove-video">Hapus Video</button></div>`:''}
-      ${field('Upload Video Beranda MP4/WebM (maks 5 MB)','videoFile','file','','accept="video/mp4,video/webm"')}
-      ${field('Atau URL Video Beranda (Link YouTube atau link .mp4)','videoUrl','url',c.videoUrl,'placeholder="https://youtu.be/... atau https://.../video.mp4"')}
+      ${c.videoPath?`<div style="margin:8px 0"><small class="muted">Video terunggah aktif (putar otomatis di beranda).</small> <button type="button" class="button small danger" data-action="remove-video">Hapus Video</button></div>`:''}
+      ${field('Upload Video Beranda MP4/WebM (maks 10 MB — putar otomatis)','videoFile','file','','accept="video/mp4,video/webm"')}
+      ${field('Atau URL Video Beranda (Link YouTube atau link .mp4 — putar otomatis)','videoUrl','url',c.videoUrl,'placeholder="https://youtu.be/... atau https://.../video.mp4"')}
       ${submit('Simpan Pengaturan & Video','green')}
     </form>
 
@@ -2170,6 +2821,21 @@ function renderCMS(){
   `;
 }
 
+function openReviewDonationModal(donationId){
+  const don=state.donations.find(x=>x.id===donationId);
+  if(!don)throw new Error('Data donasi tidak ditemukan.');
+  modal('Verifikasi Donasi Celengan Amal',`
+    <p>Donatur: <b>${esc(don.donorName||'Hamba Allah')}</b> · Nominal: <b style="color:#087b4b">${money(don.amount)}</b></p>
+    ${don.note?`<p style="font-size:13px">Pesan: <i>${esc(don.note)}</i></p>`:''}
+    <div style="text-align:center;margin:10px 0"><img src="./assets/logo.png" data-file="${esc(don.proofPath)}" alt="Bukti" style="max-width:100%;max-height:360px;border-radius:8px;border:1px solid #cbd5e1"></div>
+    ${field('Catatan Admin','reviewNote','text',don.note||'','maxlength="300"')}
+    <div class="row" style="gap:8px;margin-top:12px">
+      <button class="button green" data-action="confirm-donation" data-id="${esc(don.id)}">Konfirmasi Sah</button>
+      <button class="button danger" data-action="reject-donation" data-id="${esc(don.id)}">Tolak</button>
+    </div>
+  `);
+}
+
 function userOptions(all=false){return `${all?'<option value="all">Semua Peserta Aktif</option>':'<option value="">— Pilih Peserta —</option>'}${state.users.filter(u=>u.status==='approved').map(u=>`<option value="${esc(u.id)}">${esc(u.fullTitleName||u.name)}</option>`).join('')}`;}
 
 function renderAdminChat(force=false){
@@ -2183,7 +2849,7 @@ function renderAdminChat(force=false){
 }
 function renderChatUsers(force=false){
   const el=$('#chat-users');if(!el)return;
-  const activeUsers = state.users.filter(u=>u.status==='approved'&&u.chatAccess);
+  const activeUsers = state.users.filter(u=>u.status==='approved'&&(u.chatAccess||state.enrollments.some(e=>e.userId===u.id&&HauraFinance.isPaidFull(e))));
   if(!shouldRender('chat-users', {targetChat, activeUsers: activeUsers.map(u=>[u.id,u.name,u.fullTitleName,u.institution])}, force)) return;
   el.innerHTML=activeUsers.map(u=>`<button class="chat-user ${targetChat===u.id?'active':''}" data-action="open-chat" data-id="${esc(u.id)}">${esc(u.fullTitleName||u.name)}<br><small>${esc(u.institution||'')}</small></button>`).join('')||empty('Belum ada peserta aktif.');
 }
@@ -2229,6 +2895,23 @@ async function doAction(action,el){
   if(action==='close-modal')return close();
   if(action==='install-help')return installHelp();
   if(action==='privacy')return modal('Ketentuan Layanan',`<div class="privacy">${esc(privacyText)}</div>`);
+  if(action==='verify-receipt-modal')return openReceiptCheckModal();
+  if(action==='open-charity')return openCharityModal();
+  if(action==='banner-prev'){
+    const len=(state.cms.banners||[]).length;
+    if(len){bannerIdx=(bannerIdx-1+len)%len;renderTopBannerSlider();}
+    return;
+  }
+  if(action==='banner-next'){
+    const len=(state.cms.banners||[]).length;
+    if(len){bannerIdx=(bannerIdx+1)%len;renderTopBannerSlider();}
+    return;
+  }
+  if(action==='banner-goto'){
+    bannerIdx=Number(el.dataset.idx||0);
+    renderTopBannerSlider();
+    return;
+  }
   if(action==='offline-pass')return openOfflinePasswordModal();
   if(action==='logout'){
     OfflineAuth.clearActive();
@@ -2283,6 +2966,29 @@ async function doAction(action,el){
   if(action==='alkes-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);alkesCart[id]=Math.max(0,(Number(alkesCart[id]||0)+delta));renderMemberChatAndAlkes(true);hydrate();return;}
   if(action==='baju-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);bajuCart[id]=Math.max(0,(Number(bajuCart[id]||0)+delta));renderMemberBaju(true);hydrate();return;}
 
+  if(action==='open-receipt'){
+    const enr=state.enrollments.find(e=>e.id===el.dataset.enr);
+    const pay=(enr?.payments||[]).find(p=>p.id===el.dataset.pay);
+    if(!enr||!pay)throw new Error('Data kuitansi tidak ditemukan.');
+    const u=admin ? state.users.find(x=>x.id===enr.userId) : profile;
+    const bill=HauraFinance.billingBreakdown(enr);
+    openReceiptWindow({
+      receiptNumber: pay.receiptNumber,
+      participantName: u?.fullTitleName||u?.name||'Peserta',
+      institution: u?.institution||'-',
+      programTitle: enr.programTitle||'Program Haura Institute',
+      label: pay.label||'Pembayaran',
+      method: pay.method||'transfer',
+      amount: pay.amount,
+      billedTotal: bill.billedTotal,
+      paidAmount: bill.paidAmount,
+      remainingBalance: bill.remainingBalance,
+      confirmedAt: pay.confirmedAt||pay.submittedAt,
+      receiverName: author
+    });
+    return;
+  }
+
   if(action==='read-ebook'){
     memberBooksAccess();
     const b=state.ebooks.find(x=>x.id===el.dataset.id);
@@ -2315,20 +3021,59 @@ async function doAction(action,el){
     return;
   }
 
+  if(action==='edit-ukom-progress'){member();return openUkomProgressModal(el.dataset.id);}
+  if(action==='review-ukom'){adminOnly();return openReviewUkomModal(el.dataset.id);}
+
   if(action==='edit-pmk-docs'){member();return openPmkDocsModal(el.dataset.id);}
   if(action==='review-pmk'){adminOnly();return openReviewPmkModal(el.dataset.id);}
 
   if(action==='enroll'){if(!me)return loginForm();member();return openPaidEnrollModal(el.dataset.id);}
   if(action==='pay-installment'){member();return openInstallmentModal(el.dataset.id);}
+  if(action==='cash-payment-modal'){adminOnly();return openCashPaymentModal(el.dataset.id);}
+  if(action==='direct-cash-enroll-modal'){adminOnly();return openDirectCashEnrollModal();}
   if(action==='review-payment'){adminOnly();return openReviewPaymentModal(el.dataset.enr,el.dataset.pay);}
   if(action==='confirm-payment'||action==='reject-payment'){
     adminOnly();
     const note=$('#reviewNote')?.value||'';
     if(action==='reject-payment'&&!note.trim())throw new Error('Isi alasan penolakan.');
-    await B.confirmPayment({enrollmentId:el.dataset.enr,paymentId:el.dataset.pay,decision:action==='confirm-payment'?'confirmed':'rejected',note});
+    const res = await B.confirmPayment({enrollmentId:el.dataset.enr,paymentId:el.dataset.pay,decision:action==='confirm-payment'?'confirmed':'rejected',note});
     close();
-    return toast(action==='confirm-payment'?'Pembayaran dikonfirmasi.':'Bukti ditolak.');
+    if(action==='confirm-payment' && res?.receiptNumber){
+      toast(`Pembayaran dikonfirmasi. Kuitansi ${res.receiptNumber} terbit.`);
+    }else{
+      toast(action==='confirm-payment'?'Pembayaran dikonfirmasi.':'Bukti ditolak.');
+    }
+    return;
   }
+  if(action==='review-access-pay'){adminOnly();return openReviewAccessPayModal(el.dataset.id);}
+  if(action==='confirm-access-pay'||action==='reject-access-pay'){
+    adminOnly();
+    const note=$('#reviewNote')?.value||'';
+    await B.reviewAccessPayment({paymentId:el.dataset.id,decision:action==='confirm-access-pay'?'confirmed':'rejected',note});
+    close();
+    return toast(action==='confirm-access-pay'?'Paket akses diaktifkan.':'Pembayaran ditolak.');
+  }
+  if(action==='admin-grant-access'){adminOnly();return openGrantAccessModal(el.dataset.id);}
+
+  if(action==='review-donation'){adminOnly();return openReviewDonationModal(el.dataset.id);}
+  if(action==='confirm-donation'||action==='reject-donation'){
+    adminOnly();
+    const note=$('#reviewNote')?.value||'';
+    await B.reviewDonation({donationId:el.dataset.id,decision:action==='confirm-donation'?'confirmed':'rejected',note});
+    close();
+    return toast(action==='confirm-donation'?'Donasi amal dikonfirmasi.':'Donasi ditolak.');
+  }
+
+  if(action==='remove-banner'){
+    adminOnly();
+    const list=(state.cms.banners||[]).filter(b=>b.id!==el.dataset.id);
+    await B.patch('settings','public',{banners:list,updatedAt:B.stamp()});
+    state.cms.banners=list;
+    renderTopBannerSlider();
+    renderCMS();
+    return toast('Foto banner dihapus.');
+  }
+
   if(action==='review-chat-pay'){adminOnly();return openReviewChatPayModal(el.dataset.id);}
   if(action==='confirm-chat-pay'||action==='reject-chat-pay'){
     adminOnly();
@@ -2351,7 +3096,7 @@ async function doAction(action,el){
   if(action==='reset-logo'){adminOnly();await B.patch('settings','public',{logoPath:'',updatedAt:B.stamp()});return toast('Logo dikembalikan.');}
   if(action==='remove-video'){adminOnly();await B.patch('settings','public',{videoPath:'',updatedAt:B.stamp()});return toast('Video dihapus.');}
   if(action==='remove-qris'){adminOnly();await B.patch('settings','public',{qrisPath:'',updatedAt:B.stamp()});return toast('QRIS dihapus.');}
-  if(action==='sbar'){member();if(!profile.chatAccess)throw new Error('Akses diskusi belum aktif.');return sbarForm();}
+  if(action==='sbar'){member();if(!hasEffectiveChatAccess())throw new Error('Akses diskusi belum aktif.');return sbarForm();}
   if(action==='open-chat'){adminOnly();const u=state.users.find(u=>u.id===el.dataset.id);createRoom(u.id,u.fullTitleName||u.name);return renderChatUsers(true);}
   if(action==='older-chat'){ready();messageLimit=Math.min(messageLimit+100,1000);watchMessages();return;}
 
@@ -2415,7 +3160,7 @@ async function doAction(action,el){
   if(action==='preview-pdf'){adminOnly();toast('Menyiapkan PDF…');const canvas=await captureCertificate();return pdfDownload(canvas.toDataURL('image/jpeg',.96),'Sertifikat_Preview');}
   if(action==='approve-user'||action==='reject-user'){adminOnly();await B.patch('users',el.dataset.id,{status:action==='approve-user'?'approved':'rejected',...(action==='reject-user'?{chatAccess:false}:{}),updatedAt:B.stamp()});return toast('Status akun diperbarui.');}
   if(['archive-program','archive-news','delete-module'].includes(action)){adminOnly();return modal('Konfirmasi',`<p>Lanjutkan tindakan ini?</p><button class="button danger" data-action="confirm-change" data-kind="${action}" data-id="${esc(el.dataset.id)}">Ya, Lanjutkan</button>`);}
-  if(action==='confirm-change'){adminOnly();const kind=el.dataset.kind;if(kind==='delete-module')await B.remove('ebooks',el.dataset.id);else await B.patch(kind==='archive-program'?'programs':'news',el.dataset.id,{published:false,updatedAt:B.stamp()});close();if(tab==='cms')renderCMS();if(tab==='modules-admin')setTimeout(renderModuleAdmin,200);if(tab==='pmk-admin')setTimeout(()=>renderPMKAdmin(true),200);return toast('Perubahan tersimpan.');}
+  if(action==='confirm-change'){adminOnly();const kind=el.dataset.kind;if(kind==='delete-module')await B.remove('ebooks',el.dataset.id);else await B.patch(kind==='archive-program'?'programs':'news',el.dataset.id,{published:false,updatedAt:B.stamp()});close();if(tab==='cms')renderCMS();if(tab==='modules-admin')setTimeout(renderModuleAdmin,200);if(tab==='pmk-admin')setTimeout(()=>renderPMKAdmin(true),200);if(tab==='ukom-admin')setTimeout(()=>renderUKOMAdmin(true),200);return toast('Perubahan tersimpan.');}
   if(action==='edit-program'){
     adminOnly();
     const p=state.programs.find(p=>p.id===el.dataset.id);
@@ -2442,13 +3187,45 @@ async function doSubmit(form){
 
   ready();
 
+  if(type==='verify-receipt-form'){
+    const no = String(d.get('receiptNumber')||'').trim();
+    const res = await B.verifyReceipt(no);
+    if(!res?.valid || !res.receipt) throw new Error('Nomor seri kuitansi tidak ditemukan.');
+    return showReceiptVerificationResult(res.receipt);
+  }
+
+  if(type==='submit-charity'){
+    const file = d.get('proof');
+    const path = `public/charity/${uid()}`;
+    toast('Mengunggah bukti amal…');
+    await B.upload(path, file);
+    await B.donate({
+      donorName: String(d.get('donorName')||'Hamba Allah').trim(),
+      amount: Number(d.get('amount')||0),
+      note: String(d.get('note')||'').trim(),
+      proofPath: path
+    });
+    close();
+    return toast('Terima kasih! Bukti amal telah dikirim untuk verifikasi.');
+  }
+
+  if(type==='subscribe-access'){
+    if(!me) throw new Error('Silakan masuk.');
+    const file = d.get('proof');
+    const path = `proofs/${me.uid}/${uid()}`;
+    toast('Mengunggah bukti pembayaran paket akses…');
+    await B.upload(path, file);
+    await B.subscribeAccess({proofPath: path});
+    return toast('Bukti pembayaran paket akses terkirim. Menunggu konfirmasi admin.');
+  }
+
   if(type==='set-offline-password'){
     if(!me) throw new Error('Silakan masuk.');
     const p1 = String(d.get('newOfflinePass')||'');
     const p2 = String(d.get('confirmOfflinePass')||'');
     if(p1.length < 4) throw new Error('Password minimal 4 karakter.');
     if(p1 !== p2) throw new Error('Konfirmasi password tidak cocok.');
-    OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin});
+    OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin, gate: state.cms.subscriptionGate});
     await OfflineAuth.setOfflinePassword(me.uid, p1);
     close();
     return toast('Password Login Offline berhasil disimpan.');
@@ -2486,7 +3263,7 @@ async function doSubmit(form){
     await B.patch('users',targetUid,patchData);
     if(targetUid===me.uid && profile){
       Object.assign(profile,patchData);
-      OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin});
+      OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin, gate: state.cms.subscriptionGate});
       navRender();
       if(!$('#portal-view').hidden)dashboard();
     }
@@ -2573,6 +3350,21 @@ async function doSubmit(form){
     return toast('Pesanan PO Baju Kesehatan berhasil dikirim.');
   }
 
+  if(type==='save-ukom-progress'){
+    const enr=state.enrollments.find(e=>e.id===form.dataset.id);
+    if(!enr)throw new Error('Data bimbingan UKOM tidak ditemukan.');
+    const ukomChecklist={};
+    for(const s of UKOM_STEPS){
+      ukomChecklist[s.key]={
+        done:d.get('done_'+s.key)==='on',
+        note:String(d.get('note_'+s.key)||'').trim()
+      };
+    }
+    await B.patch('enrollments',enr.id,{ukomChecklist,updatedAt:B.stamp()});
+    close();
+    return toast('Progres belajar UKOM tersimpan.');
+  }
+
   if(type==='save-pmk-docs'){
     const enr=state.enrollments.find(e=>e.id===form.dataset.id);
     if(!enr)throw new Error('Data bimbingan tidak ditemukan.');
@@ -2596,7 +3388,7 @@ async function doSubmit(form){
   }
 
   if(type==='chat'||type==='sbar'){
-    if(!admin&&!profile.chatAccess)throw new Error('Akses diskusi belum aktif.');
+    if(!hasEffectiveChatAccess())throw new Error('Akses diskusi belum aktif.');
     const data={senderId:me.uid,senderRole:admin?'admin':'peserta',kind:type==='sbar'?'sbar':'text',text:type==='chat'?String(d.get('text')).trim():'',createdAt:B.stamp()};
     if(type==='chat'&&!data.text)return;
     if(type==='sbar')data.sbar=Object.fromEntries(['s','b','a','r'].map(k=>[k,String(d.get(k)).trim()]));
@@ -2608,6 +3400,93 @@ async function doSubmit(form){
 
   adminOnly();
 
+  if(type==='record-cash-payment'){
+    const res = await B.recordCashPayment({
+      enrollmentId: form.dataset.enr,
+      amount: Number(d.get('amount')||0),
+      note: String(d.get('note')||'').trim()
+    });
+    close();
+    toast(`Pembayaran tunai dicatat. Kuitansi ${res?.receiptNumber||''} terbit.`);
+    return;
+  }
+
+  if(type==='direct-cash-enroll'){
+    const res = await B.recordCashPayment({
+      userId: String(d.get('userId')||'').trim(),
+      programId: String(d.get('programId')||'').trim(),
+      amount: Number(d.get('amount')||0),
+      note: String(d.get('note')||'').trim()
+    });
+    close();
+    toast(`Pendaftaran & bayar tunai berhasil. Kuitansi ${res?.receiptNumber||''} terbit.`);
+    return;
+  }
+
+  if(type==='subscription-gate-config'){
+    const subscriptionGate = {
+      enabled: d.get('enabled') === 'on',
+      packageName: String(d.get('packageName')||'Akses Portal & Modul 1 Tahun').trim(),
+      price: Number(d.get('price')||50000),
+      durationDays: Number(d.get('durationDays')||365)
+    };
+    await B.patch('settings','public',{subscriptionGate,updatedAt:B.stamp()});
+    state.cms.subscriptionGate = subscriptionGate;
+    return toast('Pengaturan paket akses portal tersimpan.');
+  }
+
+  if(type==='admin-set-access'){
+    await B.setUserAccess({
+      userId: form.dataset.uid,
+      durationDays: Number(d.get('durationDays')||0)
+    });
+    close();
+    return toast('Masa aktif paket akses peserta diperbarui.');
+  }
+
+  if(type==='add-banner'){
+    const file = d.get('bannerFile');
+    if(!file || !file.size) throw new Error('Pilih file gambar banner.');
+    const path = `public/banners/${uid()}`;
+    toast('Mengunggah foto banner…');
+    await B.upload(path, file);
+    const nextBanners = [...(state.cms.banners||[]), {
+      id: uid(),
+      imagePath: path,
+      title: String(d.get('title')||'').trim(),
+      caption: String(d.get('caption')||'').trim(),
+      createdAt: new Date().toISOString()
+    }];
+    await B.patch('settings','public',{banners:nextBanners,updatedAt:B.stamp()});
+    state.cms.banners = nextBanners;
+    renderTopBannerSlider();
+    renderCMS();
+    return toast('Foto berhasil ditambahkan ke galeri banner atas.');
+  }
+
+  if(type==='charity-config'){
+    const charity = {
+      ...(state.cms.charity||{}),
+      enabled: d.get('enabled') === 'on',
+      title: String(d.get('title')||'Celengan Amal Haura Institute').trim(),
+      description: String(d.get('description')||'').trim()
+    };
+    await B.patch('settings','public',{charity,updatedAt:B.stamp()});
+    state.cms.charity = charity;
+    renderPublicCharity();
+    return toast('Pengaturan Celengan Amal tersimpan.');
+  }
+
+  if(type==='distribute-charity'){
+    await B.reviewDonation({
+      decision: 'distribute',
+      amount: Number(d.get('amount')||0),
+      distributionTarget: String(d.get('distributionTarget')||'').trim()
+    });
+    form.reset();
+    return toast('Penyaluran dana amal berhasil dicatat.');
+  }
+
   if(type==='assign-batch'){
     const batchName=String(d.get('batchName')||'').trim();
     const uids=[...document.querySelectorAll('.user-batch-pick:checked')].map(cb=>cb.value);
@@ -2617,6 +3496,16 @@ async function doSubmit(form){
     }
     form.reset();
     return toast(`Angkatan "${batchName}" diterapkan ke ${uids.length} peserta.`);
+  }
+
+  if(type==='save-ukom-review'){
+    await B.patch('enrollments',form.dataset.id,{
+      ukomStage:String(d.get('ukomStage')||'').trim(),
+      evaluationNote:String(d.get('evaluationNote')||'').trim(),
+      updatedAt:B.stamp()
+    });
+    close();
+    return toast('Progres Bimbingan UKOM diperbarui.');
   }
 
   if(type==='save-pmk-review'){
@@ -2717,39 +3606,34 @@ async function doSubmit(form){
     if(videoFile && videoFile.size>0){
       videoPath=`public/videos/${uid()}`;
       toast('Mengunggah video…');
-      await B.upload(videoPath,videoFile,['video/mp4','video/webm'],5*1024*1024);
+      await B.upload(videoPath,videoFile,['video/mp4','video/webm'],10*1024*1024);
     }
     const videoUrl=(videoFile && videoFile.size>0)?'':safeURL(d.get('videoUrl'));
     if(videoUrl)videoPath='';
 
-    await B.create('settings','public',{
+    await B.patch('settings','public',{
       logoText:d.get('logoText').trim(),
       logoPath,
       welcomeTitle:d.get('welcomeTitle').trim(),
       welcomeText:d.get('welcomeText').trim(),
-      chatFee:Number(state.cms.chatFee||50000),
-      chatDurationLabel:state.cms.chatDurationLabel||'30 Hari',
-      qrisPath:state.cms.qrisPath||'',
-      paymentInfo:state.cms.paymentInfo||'',
-      certIndex:state.cms.certIndex||{},
       videoPath,
       videoUrl,
       updatedAt:B.stamp()
     });
-    toast('Pengaturan & video tersimpan.');
+    toast('Pengaturan & video beranda tersimpan.');
     return;
   }
 
-  if(type==='program'||type==='program-pmk'||type==='edit-program'){
+  if(type==='program'||type==='program-pmk'||type==='program-ukom'||type==='edit-program'){
     const totalFee=Number(d.get('totalFee')||0);
     const minDownPayment=Number(d.get('minDownPayment')||0);
     if(minDownPayment>totalFee)throw new Error('Minimal DP melebihi total biaya.');
     const existing=type==='edit-program'?state.programs.find(x=>x.id===form.dataset.id):null;
-    const kind=type==='program-pmk'?'pmk':(existing?.kind||'training');
+    const kind=type==='program-pmk'?'pmk':(type==='program-ukom'?'ukom':(existing?.kind||'training'));
     const data={kind,title:d.get('title').trim(),description:d.get('description').trim(),totalFee,minDownPayment,price:totalFee,published:true,updatedAt:B.stamp()};
-    if(type==='program'||type==='program-pmk')await B.add('programs',{...data,createdAt:B.stamp()});
+    if(type==='program'||type==='program-pmk'||type==='program-ukom')await B.add('programs',{...data,createdAt:B.stamp()});
     else await B.patch('programs',form.dataset.id,data);
-    if(type==='program'||type==='program-pmk')form.reset();else close();
+    if(type==='program'||type==='program-pmk'||type==='program-ukom')form.reset();else close();
     toast('Program tersimpan.');
     return;
   }
@@ -2871,100 +3755,119 @@ document.addEventListener('click',async event=>{
   el.disabled=true;
   try{await doAction(el.dataset.action,el);}catch(e){fail(e);}finally{el.disabled=false;}
 });
+
 document.addEventListener('submit',async event=>{
   markUserActivity();
-  const form=event.target.closest('form[data-form]');
+  const form=event.target.closest('[data-form]');
   if(!form)return;
   event.preventDefault();
-  const button=form.querySelector('[type=submit]');
-  if(button?.disabled)return;
-  if(button)button.disabled=true;
-  try{await doSubmit(form);}catch(e){fail(e);}finally{if(button)button.disabled=false;}
+  const btn=form.querySelector('[type="submit"]');
+  if(btn)btn.disabled=true;
+  try{await doSubmit(form);}catch(e){fail(e);}finally{if(btn)btn.disabled=false;}
 });
+
+document.addEventListener('change',async event=>{
+  markUserActivity();
+  const t=event.target;
+  if(t.id==='finance-filter'){financeFilterProgram=t.value;renderFinanceAdmin(true);hydrate();return;}
+  if(t.id==='val-batch-filter'){valFilterBatch=t.value;renderValidation(true);return;}
+  if(t.id==='cert-filter-prog'){certFilterProg=t.value;renderCertificateEditor();return;}
+  if(t.id==='cert-filter-batch'){certFilterBatch=t.value;renderCertificateEditor();return;}
+  if(t.classList?.contains('cert-pick')){updateCertificate();return;}
+  const certKey=t.dataset?.certImage;
+  if(certKey && t.files?.[0]){
+    certImages[certKey]=await blobData(t.files[0]);
+    updateCertificate();
+  }
+});
+
 document.addEventListener('input',event=>{
   markUserActivity();
   if(event.target.closest('#certificate-form'))updateCertificate();
 });
-document.addEventListener('keydown', markUserActivity);
-document.addEventListener('change',async event=>{
-  markUserActivity();
-  const el=event.target;
-  if(el.id==='finance-filter'){financeFilterProgram=el.value;renderFinanceAdmin(true);hydrate();return;}
-  if(el.id==='val-batch-filter'){valFilterBatch=el.value;renderValidation(true);return;}
-  if(el.id==='cert-filter-prog'){certFilterProg=el.value;renderCertificateEditor();return;}
-  if(el.id==='cert-filter-batch'){certFilterBatch=el.value;renderCertificateEditor();return;}
-  if(el.classList?.contains('cert-pick')){updateCertificate();return;}
-  if(!el.dataset.certImage)return;
-  try{const file=el.files[0];if(file){B.validateFile(file);certImages[el.dataset.certImage]=await blobData(file);updateCertificate();}}catch(e){fail(e);el.value='';}
-});
-$('#modal').addEventListener('click',event=>{if(event.target===$('#modal')){const r=event.target.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)close();}});
-window.addEventListener('hashchange',()=>{if(location.hash==='#beranda')showLanding();});
 
-window.addEventListener('offline', () => {
-  navRender();
-  if(me && profile){
-    tab = 'modules';
-    dashboard();
-    toast('Koneksi terputus. Beralih ke Mode Offline (Login & Buku Digital tetap tersedia).');
-  } else {
-    publicRender();
-  }
-});
-
-window.addEventListener('online', async () => {
-  navRender();
+window.addEventListener('online',()=>{
+  toast('Koneksi internet kembali aktif.');
+  resetRenderHashes();
   if(me?.offline){
-    const currentUser = B?.authInstance?.().currentUser;
-    if(currentUser){
-      await handleSession(currentUser);
-      toast('Koneksi online kembali. Semua fitur portal aktif.');
-    } else {
-      toast('Koneksi internet aktif kembali. Silakan masuk ulang jika ingin membuka fitur transaksi.');
-      publicRender();
-    }
-  } else if(me && profile){
-    startPrivate();
-    dashboard();
-    toast('Koneksi internet aktif kembali.');
-  } else {
-    publicRender();
+    const saved = OfflineAuth.getActiveAccount();
+    if(saved) enterOfflineSession(saved);
+  }else{
+    navRender();
+    schedulePublicRender();
+    scheduleRefreshSection();
   }
 });
 
-async function start(){
-  await refreshOfflineBookIndex();
-  try{
-    B=await import('./backend.js');
-    if(!await B.init()){
-      if(isOffline()){
-        const saved = OfflineAuth.getActiveAccount();
-        if(saved){ await enterOfflineSession(saved); return; }
-      }
-      const notice=$('#setup-status');notice.hidden=false;notice.textContent='Konfigurasi server belum tersambung.';
-      navRender();
-      publicRender();
-      return;
-    }
-    if(isOffline()){
-      const saved = OfflineAuth.getActiveAccount();
-      if(saved){ await enterOfflineSession(saved); return; }
-      navRender();
-      publicRender();
-    }
-    publicSubscriptions.push(B.F.onSnapshot(B.F.doc(B.dbInstance(),'settings','public'),snap=>{if(snap.exists())state.cms={...state.cms,...snap.data()};schedulePublicRender();checkPublicVerification();},fail));
-    for(const key of ['programs','news','alkes'])publicSubscriptions.push(B.watch(key,[B.F.where('published','==',true)],rows=>{state[key]=rows;schedulePublicRender();scheduleRefreshSection();},fail));
-    B.F.onAuthStateChanged(B.authInstance(),user=>{if(!registering)handleSession(user);});
-  }catch(e){
-    if(isOffline()){
-      const saved = OfflineAuth.getActiveAccount();
-      if(saved){ await enterOfflineSession(saved); return; }
-      navRender();
-      publicRender();
-      return;
-    }
-    const notice=$('#setup-status');notice.hidden=false;notice.textContent='Portal belum terhubung.';publicRender();
-  }
-}
-start();
+window.addEventListener('offline',()=>{
+  toast('Mode offline aktif. Hanya Buku Digital yang tersedia.');
+  resetRenderHashes();
+  navRender();
+  schedulePublicRender();
+  if(me) dashboard();
+});
 
-document.addEventListener('haura-account-complete',()=>{close();toast('Akun tersambung.');});
+window.addEventListener('message',async event=>{
+  if(event.origin!==location.origin || !event.data?.hauraAccount)return;
+  const msg=event.data.hauraAccount;
+  try{
+    if(msg.type==='login'){
+      await B.F.signInWithEmailAndPassword(B.authInstance(),msg.email,msg.password);
+      close();
+      toast('Selamat datang kembali.');
+    }else if(msg.type==='register'){
+      registering=true;
+      try{
+        const cred=await B.F.createUserWithEmailAndPassword(B.authInstance(),msg.email,msg.password);
+        await B.create('users',cred.user.uid,{
+          name:msg.name,
+          fullTitleName:msg.name,
+          email:msg.email,
+          institution:msg.institution,
+          phone:msg.phone||'',
+          status:'pending',
+          chatAccess:false,
+          createdAt:B.stamp()
+        });
+      }finally{registering=false;}
+      close();
+      toast('Pendaftaran berhasil. Menunggu aktivasi admin.');
+      dashboard();
+    }else if(msg.type==='change'){
+      if(!me)throw new Error('Silakan masuk.');
+      const cred=B.F.EmailAuthProvider.credential(me.email,msg.current);
+      await B.F.reauthenticateWithCredential(me,cred);
+      await B.F.updatePassword(me,msg.next);
+      close();
+      toast('Password berhasil diperbarui.');
+    }
+  }catch(e){
+    const frame=document.querySelector('#modal iframe');
+    frame?.contentWindow?.postMessage({hauraAccountResult:{ok:false,message:B?.errorMessage(e)||e.message}},location.origin);
+  }
+});
+
+(async()=>{
+  try{
+    const mod=await import('./backend.js');
+    B=mod.B;
+    if(B?.configured){
+      publicSubscriptions.push(B.watch('settings',[B.F.where(B.F.documentId(),'==','public')],rows=>{
+        if(rows[0]) state.cms={...state.cms,...rows[0]};
+        schedulePublicRender();
+        checkPublicVerification();
+      },fail));
+      publicSubscriptions.push(B.watch('programs',[],rows=>{state.programs=rows;schedulePublicRender();scheduleRefreshSection();},fail));
+      publicSubscriptions.push(B.watch('news',[],rows=>{state.news=rows;schedulePublicRender();},fail));
+      publicSubscriptions.push(B.watch('alkes',[],rows=>{state.alkes=rows;scheduleRefreshSection();},fail));
+      publicSubscriptions.push(B.watch('donations',[],rows=>{state.donations=rows;schedulePublicRender();if(tab==='cms')renderCMS();},fail));
+      B.F.onAuthStateChanged(B.authInstance(),handleSession);
+    }else{
+      publicRender();
+    }
+  }catch(e){
+    console.error(e);
+    publicRender();
+  }
+  navRender();
+})();
