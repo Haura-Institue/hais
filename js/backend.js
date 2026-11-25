@@ -20,6 +20,16 @@ function writeSavedSession(data){
 
 const initialSession=readSavedSession();
 let sessionToken=initialSession?.token||'';
+let latestServerTimeMs=0;
+function recordServerTime(ms){
+  const n=Number(ms||0);
+  if(Number.isFinite(n)&&n>latestServerTimeMs){
+    latestServerTimeMs=n;
+    try{document.dispatchEvent(new CustomEvent('haura-server-time',{detail:{serverTime:n}}));}catch{}
+  }
+}
+export const getServerTime=()=>latestServerTimeMs||Date.now();
+
 const auth={currentUser:initialSession?{...initialSession.user,getIdToken:async()=>sessionToken}:null};
 const authObservers=new Set();
 let cache={}, cacheUID=auth.currentUser?.uid||null, epoch=0, fileEpoch=0, inFlight=null;
@@ -36,7 +46,7 @@ async function sync(){
   if(cacheUID!==who){epoch++;cache={};cacheUID=who;inFlight=null;clearFiles();}
   if(inFlight)return inFlight;
   const generation=epoch;
-  const job=(async()=>{try{const data=await bridge.call('snapshot');if(generation!==epoch || (auth?.currentUser?.uid||'')!==who)return;cache=data;emit();}catch(e){if(generation===epoch)for(const w of [...watchers])w.fail?.(e);if(/^Sesi|^Wajib mengganti/.test(e.message)&&auth.currentUser)setSession(null);throw e;}})();
+  const job=(async()=>{try{const data=await bridge.call('snapshot');if(generation!==epoch || (auth?.currentUser?.uid||'')!==who)return;if(data?.__serverTime)recordServerTime(data.__serverTime);cache=data;emit();}catch(e){if(generation===epoch)for(const w of [...watchers])w.fail?.(e);if(/^Sesi|^Wajib mengganti/.test(e.message)&&auth.currentUser)setSession(null);throw e;}})();
   inFlight=job;try{await job;}finally{if(inFlight===job)inFlight=null;}
 }
 setInterval(()=>{if(watchers.size&&!document.hidden&&bridge.configured)sync().catch(()=>{});},Math.max(20000,driveConfig.pollMs||30000));
@@ -57,6 +67,7 @@ export const F={
   async getIdTokenResult(){
     try{
       const identity=await bridge.call('identity');
+      if(identity?.serverTime)recordServerTime(identity.serverTime);
       return {claims:{admin:identity.admin}};
     }catch(e){
       if(/^Sesi|^Wajib mengganti/.test(e.message)&&auth.currentUser)setSession(null);
@@ -65,10 +76,10 @@ export const F={
   },
   onAuthStateChanged:(_a,cb)=>{authObservers.add(cb);queueMicrotask(()=>cb(auth.currentUser));return()=>authObservers.delete(cb);},
   async signOut(){try{if(auth.currentUser)await bridge.call('authLogout');}finally{setSession(null);}},
-  async reload(){await bridge.call('identity');},
+  async reload(){const id=await bridge.call('identity');if(id?.serverTime)recordServerTime(id.serverTime);},
   writeBatch:()=>{const ops=[];return {update:(ref,data)=>ops.push({op:'patch',...ref,data}),commit:()=>mutate(ops)};}
 };
-export function validateFile(file,allowed=['image/jpeg','image/png','image/webp'],max=5*1024*1024){if(!file||!allowed.includes(file.type))throw new Error('Format berkas tidak didukung.');if(!file.size||file.size>Math.min(max,5*1024*1024))throw new Error('Ukuran berkas maksimal 5 MB.');}
+export function validateFile(file,allowed=['image/jpeg','image/png','image/webp'],max=5*1024*1024){const limit=Math.min(max,10*1024*1024);if(!file||!allowed.includes(file.type))throw new Error('Format berkas tidak didukung.');if(!file.size||file.size>limit)throw new Error('Ukuran berkas melebihi batas maksimal.');}
 export async function upload(path,file,allowed,max){requireStorage();validateFile(file,allowed,max);const base64=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result).split(',')[1]);r.onerror=reject;r.readAsDataURL(file);});await bridge.call('fileWrite',{path,mime:file.type,base64});return path;}
 export const publicFileURL=()=>'';
 export async function fileURL(path){
@@ -91,6 +102,7 @@ export function clearFiles(){fileEpoch++;for(const url of blobs.values())URL.rev
 export function errorMessage(e){return e?.message||'Operasi gagal. Periksa koneksi internet.';}
 
 function setSession(data){
+  if(data?.serverTime)recordServerTime(data.serverTime);
   writeSavedSession(data);
   sessionToken=data?.token||'';
   auth.currentUser=data?{...data.user,getIdToken:async()=>sessionToken}:null;
@@ -113,10 +125,17 @@ export function accountFrame(mode='login'){
 export async function resetMember(uid){return bridge.call('authReset',{uid});}
 export async function paidEnroll(payload){return runAndSync('paidEnroll',payload);}
 export async function submitPayment(payload){return runAndSync('submitPayment',payload);}
+export async function recordCashPayment(payload){return runAndSync('recordCashPayment',payload);}
 export async function confirmPayment(payload){return runAndSync('confirmPayment',payload);}
+export async function verifyReceipt(receiptNumber){return bridge.call('verifyReceipt',{receiptNumber});}
 export async function saveEvaluation(payload){return runAndSync('saveEvaluation',payload);}
 export async function subscribeChat(payload){return runAndSync('subscribeChat',payload);}
 export async function reviewChatPayment(payload){return runAndSync('reviewChatPayment',payload);}
+export async function subscribeAccess(payload){return runAndSync('subscribeAccess',payload);}
+export async function reviewAccessPayment(payload){return runAndSync('reviewAccessPayment',payload);}
+export async function setUserAccess(payload){return runAndSync('setUserAccess',payload);}
+export async function donate(payload){return runAndSync('donate',payload);}
+export async function reviewDonation(payload){return runAndSync('reviewDonation',payload);}
 export async function orderAlkes(payload){return runAndSync('orderAlkes',payload);}
 export async function reviewAlkesOrder(payload){return runAndSync('reviewAlkesOrder',payload);}
 export async function addExpense(payload){return runAndSync('addExpense',payload);}
