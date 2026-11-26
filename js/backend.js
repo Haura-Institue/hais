@@ -147,6 +147,18 @@ export async function verifyReceipt(receiptNumber){
   return found?{valid:true,receipt:found}:{valid:false,receipt:null};
 }
 export async function saveEvaluation(payload){return runAndSync('saveEvaluation',payload);}
+export async function saveCertConfig(payload){
+  const args=payload&&Object.prototype.hasOwnProperty.call(payload,'certConfig')?payload:{certConfig:payload};
+  return runAndSync('saveCertConfig',args);
+}
+export async function startEvaluation(payload){
+  const args=typeof payload==='string'?{evaluationId:payload}:payload;
+  const result=await runAndSync('startEvaluation',args);
+  if(result?.serverTime)recordServerTime(result.serverTime);
+  return result;
+}
+export async function submitEvaluation(payload){return runAndSync('submitEvaluation',payload);}
+export async function resetEvaluationSubmission(payload){return runAndSync('resetEvaluationSubmission',payload);}
 export async function subscribeChat(payload){return runAndSync('subscribeChat',payload);}
 export async function reviewChatPayment(payload){return runAndSync('reviewChatPayment',payload);}
 export async function subscribeAccess(payload){return runAndSync('subscribeAccess',payload);}
@@ -166,7 +178,8 @@ export const B={
   configured,getServerTime,storageConfigured,requireStorage,init,authInstance,dbInstance,stamp,
   watch,read,create,patch,remove,add,F,validateFile,upload,publicFileURL,fileURL,readHtmlFile,
   removeFile,clearFiles,errorMessage,accountFrame,resetMember,paidEnroll,submitPayment,
-  recordCashPayment,confirmPayment,verifyReceipt,saveEvaluation,subscribeChat,reviewChatPayment,
+  recordCashPayment,confirmPayment,verifyReceipt,saveEvaluation,saveCertConfig,
+  startEvaluation,submitEvaluation,resetEvaluationSubmission,subscribeChat,reviewChatPayment,
   subscribeAccess,reviewAccessPayment,setUserAccess,donate,reviewDonation,orderAlkes,
   reviewAlkesOrder,addExpense,removeExpense
 };
