@@ -69,6 +69,7 @@ export async function add(c,data){const id=crypto.randomUUID();await create(c,id
 export const F={
   where:(field,op,value)=>{if(op!=='==')throw new Error('Filter tidak didukung.');return {type:'where',field,value};},
   orderBy:(field,direction)=>({type:'orderBy',field,direction}),limit:count=>({type:'limit',count}),
+  documentId:()=>'id',
   doc:(_db,c,id)=>({c,id}),onSnapshot:(ref,ok,fail)=>subscribe(ref.c,[],ok,fail,ref.id),
   async getIdTokenResult(){
     try{
@@ -122,7 +123,12 @@ export function accountFrame(mode='login'){
   const handler=event=>{const d=event.data;if(!d||d.channel!==channel||(!/^https:\/\/(?:[a-z0-9-]+\.)?googleusercontent\.com$/.test(event.origin)&&event.origin!=='https://script.google.com'))return;
     if(d.type==='haura-account-ready'&&!target){target=event.source;origin=event.origin;if(mode==='change')target.postMessage({type:'haura-account-session',channel,token:sessionToken},origin);return;}
     if(d.type!=='haura-account-done'||event.source!==target||event.origin!==origin)return;
-    if(!d.data?.token||!d.data?.user?.uid)return;window.removeEventListener('message',handler);setSession(d.data);document.dispatchEvent(new Event('haura-account-complete'));
+    if(!d.data?.token||!d.data?.user?.uid)return;
+    window.removeEventListener('message',handler);
+    const modal=document.querySelector('#modal');
+    if(modal?.open){modal.close();const body=document.querySelector('#modal-body');if(body)body.innerHTML='';}
+    setSession(d.data);
+    document.dispatchEvent(new Event('haura-account-complete'));
   };
   window.addEventListener('message',handler);setTimeout(()=>window.removeEventListener('message',handler),20*60*1000);
   const src=effectiveConfig.webAppUrl+'?view=account&mode='+encodeURIComponent(mode)+'&channel='+channel+'&parentOrigin='+encodeURIComponent(location.origin);
@@ -131,9 +137,15 @@ export function accountFrame(mode='login'){
 export async function resetMember(uid){return bridge.call('authReset',{uid});}
 export async function paidEnroll(payload){return runAndSync('paidEnroll',payload);}
 export async function submitPayment(payload){return runAndSync('submitPayment',payload);}
-export async function recordCashPayment(payload){return runAndSync('recordCashPayment',payload);}
+export async function recordCashPayment(payload){
+  const [uId,pId]=String(payload?.enrollmentId||'').split('_');
+  return runAndSync('recordCashPayment',{...payload,userId:payload?.userId||uId,programId:payload?.programId||pId});
+}
 export async function confirmPayment(payload){return runAndSync('confirmPayment',payload);}
-export async function verifyReceipt(receiptNumber){return bridge.call('verifyReceipt',{receiptNumber});}
+export async function verifyReceipt(receiptNumber){
+  const found=await bridge.call('verifyReceipt',{receiptNumber});
+  return found?{valid:true,receipt:found}:{valid:false,receipt:null};
+}
 export async function saveEvaluation(payload){return runAndSync('saveEvaluation',payload);}
 export async function subscribeChat(payload){return runAndSync('subscribeChat',payload);}
 export async function reviewChatPayment(payload){return runAndSync('reviewChatPayment',payload);}
@@ -141,8 +153,21 @@ export async function subscribeAccess(payload){return runAndSync('subscribeAcces
 export async function reviewAccessPayment(payload){return runAndSync('reviewAccessPayment',payload);}
 export async function setUserAccess(payload){return runAndSync('setUserAccess',payload);}
 export async function donate(payload){return runAndSync('donate',payload);}
-export async function reviewDonation(payload){return runAndSync('reviewDonation',payload);}
+export async function reviewDonation(payload){
+  const args=payload?.decision==='distribute'?{...payload,mode:'distribute',note:payload.note||payload.distributionTarget||''}:payload;
+  return runAndSync('reviewDonation',args);
+}
 export async function orderAlkes(payload){return runAndSync('orderAlkes',payload);}
 export async function reviewAlkesOrder(payload){return runAndSync('reviewAlkesOrder',payload);}
 export async function addExpense(payload){return runAndSync('addExpense',payload);}
 export async function removeExpense(expenseId){return runAndSync('removeExpense',{expenseId});}
+
+export const B={
+  configured,getServerTime,storageConfigured,requireStorage,init,authInstance,dbInstance,stamp,
+  watch,read,create,patch,remove,add,F,validateFile,upload,publicFileURL,fileURL,readHtmlFile,
+  removeFile,clearFiles,errorMessage,accountFrame,resetMember,paidEnroll,submitPayment,
+  recordCashPayment,confirmPayment,verifyReceipt,saveEvaluation,subscribeChat,reviewChatPayment,
+  subscribeAccess,reviewAccessPayment,setUserAccess,donate,reviewDonation,orderAlkes,
+  reviewAlkesOrder,addExpense,removeExpense
+};
+export default B;
