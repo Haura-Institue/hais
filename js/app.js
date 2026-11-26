@@ -4878,13 +4878,16 @@ window.addEventListener('offline', async () => {
 });
 
 addEventListener('DOMContentLoaded',async()=>{
-  $('#privacy-link').textContent=`Ketentuan Layanan · ${author}`;
+  const privacyLink = $('[data-action="privacy"]');
+if (privacyLink) {
+  privacyLink.textContent = `Ketentuan Layanan · ${author}`;
+}
   await refreshOfflineBookIndex();
   publicRender();
   navRender();
 
-  const {loadBackend}=await import('./backend.js');
-  B=await loadBackend();
+const { default: backend } = await import('./backend.js');
+B = backend;
   if(!B.configured){
     $('#hero-title').textContent='Layanan Portal Belum Dikonfigurasi';
     $('#hero-description').textContent='Isi konfigurasi server pada assets/config.js untuk mengaktifkan data dan pendaftaran.';
