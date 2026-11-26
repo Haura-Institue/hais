@@ -15,17 +15,29 @@ let activeReaderBookId='';
 let verifyHandled=false;
 let offlineBookIds=new Set();
 let bannerIdx=0, bannerTimer=null;
+
+let evalFilterProg='ALL', evalFilterBatch='ALL';
+let activeEvalSession=null, evalCountdownTimer=null;
+let builderQuestions=[];
+
 let state={
   cms:{
     logoText:'HAURA',logoPath:'',welcomeTitle:'Tumbuh bersama. Merawat lebih baik.',
     welcomeText:'Pelatihan keperawatan, buku digital, konsultasi klinis, dan pendampingan praktik mandiri dalam satu portal.',
     chatFee:50000,chatDurationLabel:'30 Hari',videoUrl:'',videoPath:'',qrisPath:'',paymentInfo:'',
     certIndex:{},banners:[],subscriptionGate:{enabled:false,price:50000,durationDays:365,packageName:'Akses Portal & Modul 1 Tahun'},
-    charity:{enabled:true,title:'Celengan Amal Haura Institute',description:'Dana sosial untuk kegiatan kemanusiaan, santunan, dan bakti kesehatan masyarakat.',totalCollected:0,totalDistributed:0}
+    charity:{enabled:true,title:'Celengan Amal Haura Institute',description:'Dana sosial untuk kegiatan kemanusiaan, santunan, dan bakti kesehatan masyarakat.',totalCollected:0,totalDistributed:0},
+    certConfig:{
+      signerName:author,signerTitle:'Direktur Haura Institute',signerIdNumber:'',city:'Lombok Tengah',
+      signaturePath:'',stampPath:'',defaultProgramId:'',
+      bodyTemplate:'Diberikan kepada peserta yang telah menyelesaikan program dan evaluasi dengan baik:',
+      predicateRules:{minA:85,labelA:'Sangat Memuaskan',minB:75,labelB:'Memuaskan',minC:60,labelC:'Cukup',labelD:'Kurang'}
+    }
   },
-  programs:[],news:[],users:[],enrollments:[],chatPayments:[],accessPayments:[],donations:[],alkes:[],alkesOrders:[],ebooks:[],certificates:[],expenses:[],messages:[]
+  programs:[],news:[],users:[],enrollments:[],chatPayments:[],accessPayments:[],donations:[],alkes:[],alkesOrders:[],ebooks:[],certificates:[],expenses:[],messages:[],
+  evaluations:[],evaluationSubmissions:[]
 };
-let certImages={main:'./assets/logo.png',partner:'',left:'',right:''};
+let certImages={main:'./assets/logo.png',partner:'',left:'',right:'',stamp:''};
 
 const isOffline = () => !navigator.onLine;
 const isOfflineSession = () => Boolean(me?.offline || isOffline());
@@ -43,6 +55,7 @@ const renderHashes = {};
 function markUserActivity(){ lastUserInputAt = Date.now(); }
 
 function isUserBusy(){
+  if(activeEvalSession) return true;
   const reader = $('#ebook-reader');
   if(reader && reader.style.display === 'flex') return true;
   if($('#modal')?.open) return true;
@@ -326,6 +339,59 @@ function youtubeEmbedURL(v){
   return /^[A-Za-z0-9_-]{11}$/.test(id)?`https://www.youtube-nocookie.com/embed/${id}?autoplay=1&mute=1&loop=1&playlist=${id}&rel=0`:'';
 }
 
+/* ============================================================================
+   PREDIKAT OTOMATIS DARI NILAI EVALUASI & KONFIGURASI SERTIFIKAT
+   ============================================================================ */
+function getPredicateRules(){
+  const cfg = state.cms?.certConfig || {};
+  const r = cfg.predicateRules || {};
+  const minA = Number.isFinite(Number(r.minA)) ? Number(r.minA) : 85;
+  const minB = Number.isFinite(Number(r.minB)) ? Number(r.minB) : 75;
+  const minC = Number.isFinite(Number(r.minC)) ? Number(r.minC) : 60;
+  return {
+    minA,
+    labelA: String(r.labelA || 'Sangat Memuaskan').trim() || 'Sangat Memuaskan',
+    minB,
+    labelB: String(r.labelB || 'Memuaskan').trim() || 'Memuaskan',
+    minC,
+    labelC: String(r.labelC || 'Cukup').trim() || 'Cukup',
+    labelD: String(r.labelD || 'Kurang').trim() || 'Kurang'
+  };
+}
+
+function computeAutoPredicate(score){
+  if(score === null || score === undefined || score === '') return '';
+  const n = Number(score);
+  if(!Number.isFinite(n)) return '';
+  const rules = getPredicateRules();
+  if(n >= rules.minA) return rules.labelA;
+  if(n >= rules.minB) return rules.labelB;
+  if(n >= rules.minC) return rules.labelC;
+  return rules.labelD;
+}
+
+function resolveParticipantScoreAndPredicate(enr, cert=null){
+  const sub = (state.evaluationSubmissions || []).find(s =>
+    s && s.status === 'submitted' && s.userId === enr?.userId &&
+    (!enr.programId || s.programId === enr.programId)
+  );
+  let rawScore = null;
+  if(sub && sub.score !== null && sub.score !== undefined && sub.score !== ''){
+    rawScore = Number(sub.score);
+  }else if(enr && enr.score !== null && enr.score !== undefined && enr.score !== ''){
+    rawScore = Number(enr.score);
+  }else if(cert && cert.score !== null && cert.score !== undefined && cert.score !== ''){
+    rawScore = Number(cert.score);
+  }
+  const hasScore = rawScore !== null && Number.isFinite(rawScore);
+  const autoPred = hasScore ? computeAutoPredicate(rawScore) : (enr?.predicate || cert?.predicate || '');
+  return {
+    score: hasScore ? rawScore : null,
+    predicate: autoPred,
+    fromDigitalEval: Boolean(sub)
+  };
+}
+
 function getEffectiveGate(){
   if(state.cms?.subscriptionGate && typeof state.cms.subscriptionGate.enabled === 'boolean'){
     return state.cms.subscriptionGate;
@@ -538,7 +604,7 @@ async function checkPublicVerification(){
           <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Nama Pemilik</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.name)}</b></td></tr>
           <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Instansi</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5">${esc(rec.institution||'-')}</td></tr>
           <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Program Pelatihan</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.course)}</b></td></tr>
-          <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Predikat</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.predicate||'PARTICIPANT')}</b></td></tr>
+          <tr><td style="padding:7px 10px;border-bottom:1px solid #d1fae5;color:#475569">Predikat</td><td style="padding:7px 10px;border-bottom:1px solid #d1fae5"><b>${esc(rec.predicate||'Memuaskan')}</b></td></tr>
           <tr><td style="padding:7px 10px;color:#475569">Tanggal Terbit</td><td style="padding:7px 10px">${esc(rec.issuedDate||'-')}</td></tr>
         </table>
       </div>
@@ -725,6 +791,8 @@ function applyBrandLogos(){
 }
 
 function showLanding(){
+  stopEvalCountdown();
+  activeEvalSession=null;
   $('#landing-view').hidden=false;
   $('#portal-view').hidden=true;
   if($('#subscription-lock-view')) $('#subscription-lock-view').hidden=true;
@@ -873,8 +941,8 @@ function navRender(){
   `;
 }
 
-const memberTabs=[['catalog','Program & Evaluasi'],['modules','Buku Digital'],['ukom','Bimbingan UKOM'],['pmk','Praktik Mandiri (PMK)'],['baju','PO Baju Kesehatan'],['certificates','Sertifikat'],['chat','Diskusi & Alkes']];
-const adminTabs=[['finance','Keuangan & Evaluasi'],['validation','Peserta & Angkatan'],['cms','CMS, Banner & Amal'],['modules-admin','Buku & Fisik'],['ukom-admin','Bimbingan UKOM'],['pmk-admin','Bimbingan PMK'],['baju-admin','PO Baju Kesehatan'],['cert-admin','Sertifikat & Cetak'],['chat-admin','Diskusi SBAR']];
+const memberTabs=[['catalog','Program'],['evaluations','Evaluasi'],['modules','Buku Digital'],['ukom','Bimbingan UKOM'],['pmk','Praktik Mandiri (PMK)'],['baju','PO Baju Kesehatan'],['certificates','Sertifikat'],['chat','Diskusi & Alkes']];
+const adminTabs=[['finance','Keuangan'],['evaluations-admin','Evaluasi Digital'],['validation','Peserta & Angkatan'],['cms','CMS, Banner & Amal'],['modules-admin','Buku & Fisik'],['ukom-admin','Bimbingan UKOM'],['pmk-admin','Bimbingan PMK'],['baju-admin','PO Baju Kesehatan'],['cert-admin','Sertifikat & Cetak'],['chat-admin','Diskusi SBAR']];
 
 function tabsRender(force=false){
   const offline = isOffline();
@@ -954,6 +1022,8 @@ function renderTab(fresh=false){
     tabsRender(true);
   }
   if(tab==='catalog')renderCatalog(fresh);
+  if(tab==='evaluations')renderMemberEvaluations(fresh);
+  if(tab==='evaluations-admin'&&fresh)renderEvaluationsAdmin();
   if(tab==='finance'&&admin)renderFinanceAdmin(fresh);
   if(tab==='validation')renderValidation(fresh);
   if(tab==='modules')renderMemberModules(fresh);
@@ -974,6 +1044,7 @@ function renderTab(fresh=false){
 
 function refreshSection(force=false){
   if(!me||!profile)return;
+  if(activeEvalSession && !force)return;
   if(!admin && profile.status==='approved'){
     const gate = getAccessCheck();
     if(gate.blocked){
@@ -991,7 +1062,7 @@ function refreshSection(force=false){
     return;
   }
   if(admin) tabsRender(force);
-  if(['catalog','finance','validation','modules','ukom','pmk','baju','certificates','chat'].includes(tab)) renderTab(force);
+  if(['catalog','evaluations','finance','validation','modules','ukom','pmk','baju','certificates','chat'].includes(tab)) renderTab(force);
   if(tab==='ukom-admin') renderUKOMAdmin(force);
   if(tab==='pmk-admin') renderPMKAdmin(force);
   if(tab==='baju-admin') renderBajuAdmin(force);
@@ -999,6 +1070,8 @@ function refreshSection(force=false){
 }
 
 function stopPrivate(){
+  stopEvalCountdown();
+  activeEvalSession=null;
   $('#portal-content').innerHTML='';
   $('#portal-heading').innerHTML='';
   $('#tabs').innerHTML='';
@@ -1006,7 +1079,7 @@ function stopPrivate(){
   subscriptions.forEach(s=>s());subscriptions=[];
   ownStop?.();ownStop=null;
   chatStop?.();chatStop=null;
-  state.users=[];state.enrollments=[];state.chatPayments=[];state.accessPayments=[];state.alkesOrders=[];state.ebooks=[];state.certificates=[];state.expenses=[];state.messages=[];
+  state.users=[];state.enrollments=[];state.chatPayments=[];state.accessPayments=[];state.alkesOrders=[];state.ebooks=[];state.certificates=[];state.expenses=[];state.messages=[];state.evaluations=[];state.evaluationSubmissions=[];
   targetChat='';alkesCart={};bajuCart={};
   B?.clearFiles();
   applyBrandLogos();
@@ -1040,6 +1113,8 @@ function startPrivate(){
   listen('accessPayments',admin?[]:own,'accessPayments');
   listen('alkesOrders',admin?[]:own,'alkesOrders');
   listen('certificates',admin?[]:own,'certificates');
+  listen('evaluations',[],'evaluations');
+  listen('evaluationSubmissions',admin?[]:own,'evaluationSubmissions');
   if(admin){
     listen('ebooks',[],'ebooks', rows => syncOfflineEbooks(me.uid, rows));
   } else {
@@ -1251,7 +1326,7 @@ function openIdCardModal(targetUid=null){
           <div style="text-align:right;font-size:9.5px">
             <div style="color:#64748b">Direktur Haura Institute</div>
             <div style="height:28px"></div>
-            <b style="color:#082740">${esc(author)}</b>
+            <b style="color:#082740">${esc(state.cms?.certConfig?.signerName||author)}</b>
           </div>
         </div>
       </div>
@@ -1272,7 +1347,7 @@ function renderCatalog(force=false){
     return kind==='training';
   });
   const availablePrograms=state.programs.filter(p=>(!p.kind||p.kind==='training')&&HauraFinance.programFee(p)>0);
-  if(!shouldRender('catalog', {myEnr, availablePrograms}, force)) return;
+  if(!shouldRender('catalog', {myEnr, availablePrograms, subs: state.evaluationSubmissions, rules: getPredicateRules()}, force)) return;
 
   const myEnrHtml=myEnr.length ? myEnr.map(enr=>{
     const prog=state.programs.find(p=>p.id===enr.programId);
@@ -1280,6 +1355,7 @@ function renderCatalog(force=false){
     const st=HauraFinance.statusLabel(enr);
     const bill=HauraFinance.billingBreakdown(enr);
     const hasPending=bill.pendingPayments.length>0;
+    const scoreInfo=resolveParticipantScoreAndPredicate(enr);
 
     return `<article class="card" style="border-left:4px solid ${bill.isPaidFull?'#087b4b':'#d97706'}">
       <div class="row spread" style="flex-wrap:wrap;gap:6px">
@@ -1310,7 +1386,7 @@ function renderCatalog(force=false){
       ${bill.isPaidFull ? `
         <div style="background:#ecfdf5;border:1px solid #a7f3d0;padding:12px;border-radius:10px;color:#065f46">
           <b>Hasil Evaluasi & Akses Live Chat Aktif</b>
-          <p style="margin:4px 0">Nilai Akhir: <b>${enr.score!==null&&enr.score!==undefined?esc(enr.score):'Belum dinilai'}</b></p>
+          <p style="margin:4px 0">Nilai Akhir: <b>${scoreInfo.score!==null?esc(scoreInfo.score):'Belum dinilai'}</b>${scoreInfo.predicate?` · Predikat: <b>${esc(scoreInfo.predicate)}</b>`:''}</p>
           ${enr.evaluationNote?`<p style="margin:4px 0;font-size:13px">Catatan: ${esc(enr.evaluationNote)}</p>`:''}
         </div>
       ` : `
@@ -1342,6 +1418,396 @@ function renderCatalog(force=false){
     <div class="stack" style="margin-bottom:24px">${myEnrHtml}</div>
     <h3 class="section-title">Katalog Program Pelatihan</h3>
     <div class="cards">${catalogHtml}</div>
+  `;
+}
+
+/* ============================================================================
+1B. EVALUASI DIGITAL BERBASIS ANGKATAN & KUNCI JAWABAN (PESERTA & ADMIN)
+   ============================================================================ */
+function stopEvalCountdown(){
+  if(evalCountdownTimer){
+    clearInterval(evalCountdownTimer);
+    evalCountdownTimer=null;
+  }
+}
+
+function formatTimerSec(sec){
+  const s=Math.max(0,Number(sec||0));
+  const m=Math.floor(s/60);
+  const r=s%60;
+  return `${String(m).padStart(2,'0')}:${String(r).padStart(2,'0')}`;
+}
+
+function batchMatchesClient(userBatch, targetBatch){
+  const tb=String(targetBatch||'').trim();
+  if(!tb||tb.toUpperCase()==='ALL')return true;
+  const ub=String(userBatch||'').trim();
+  return ub.length>0 && ub.toLowerCase()===tb.toLowerCase();
+}
+
+function renderActiveExamRunner(root){
+  const ev=activeEvalSession?.evaluation;
+  if(!ev){activeEvalSession=null;return renderMemberEvaluations(true);}
+  const qs=Array.isArray(ev.questions)?ev.questions:[];
+  const answers=activeEvalSession.answers||{};
+  const answeredCount=qs.filter(q=>answers[q.id]!==undefined&&answers[q.id]!==null&&answers[q.id]!=='').length;
+
+  root.innerHTML=`
+    <div class="eval-timer-bar">
+      <div>
+        <div style="font-size:11px;letter-spacing:1px;color:#e6d196">EVALUASI DIGITAL SEDANG BERLANGSUNG</div>
+        <b style="font-size:15px">${esc(ev.title)}</b> <small style="opacity:.85">(${esc(ev.programTitle||'')})</small>
+      </div>
+      <div class="row" style="gap:10px;align-items:center">
+        <span style="font-size:12.5px">Terjawab: <b id="eval-answered-count">${answeredCount}</b>/${qs.length}</span>
+        <span id="eval-countdown-pill" class="eval-timer-pill">Memuat waktu…</span>
+      </div>
+    </div>
+
+    <form id="eval-exam-form" data-form="submit-evaluation-exam" data-eval-id="${esc(ev.id)}">
+      ${qs.map((q,qIdx)=>{
+        const sel=answers[q.id];
+        return `<div class="eval-question-card">
+          <div class="eval-q-title">Soal ${qIdx+1}. ${esc(q.text)}</div>
+          <div class="eval-options">
+            ${(q.options||[]).map((opt,oIdx)=>{
+              const checked=Number(sel)===oIdx;
+              const letter=String.fromCharCode(65+oIdx);
+              return `<label class="eval-option ${checked?'selected':''}">
+                <input type="radio" name="q_${esc(q.id)}" value="${oIdx}" data-qid="${esc(q.id)}" ${checked?'checked':''}>
+                <span><b>${letter}.</b> ${esc(opt)}</span>
+              </label>`;
+            }).join('')}
+          </div>
+        </div>`;
+      }).join('')}
+
+      <div class="row spread" style="gap:10px;flex-wrap:wrap;margin-top:16px">
+        <button type="button" class="button ghost" data-action="cancel-eval-runner">Kembali ke Daftar Evaluasi</button>
+        <button type="submit" id="eval-submit-btn" class="button green">Kumpulkan & Hitung Nilai Otomatis</button>
+      </div>
+    </form>
+  `;
+
+  stopEvalCountdown();
+  const updateTimer=()=>{
+    if(!activeEvalSession)return stopEvalCountdown();
+    const now=getTrustedTimeMs();
+    const remSec=Math.max(0,Math.floor((Number(activeEvalSession.expiresAtMs||now)-now)/1000));
+    const pill=$('#eval-countdown-pill');
+    if(pill){
+      pill.textContent=`Sisa Waktu: ${formatTimerSec(remSec)}`;
+      pill.classList.toggle('urgent',remSec<=120);
+    }
+    if(remSec<=0){
+      stopEvalCountdown();
+      toast('Waktu pengerjaan habis! Mengirim jawaban otomatis…');
+      $('#eval-exam-form')?.requestSubmit();
+    }
+  };
+  updateTimer();
+  evalCountdownTimer=setInterval(updateTimer,1000);
+}
+
+function renderMemberEvaluations(force=false){
+  const root=$('#portal-content');
+  if(activeEvalSession){
+    renderActiveExamRunner(root);
+    return;
+  }
+  stopEvalCountdown();
+
+  const myBatch=String(profile?.batch||'').trim();
+  const availableEvals=(state.evaluations||[]).filter(ev=>{
+    if(ev.active!==true)return false;
+    const hasEnr=state.enrollments.some(e=>e.userId===me.uid&&e.programId===ev.programId);
+    if(!hasEnr)return false;
+    return batchMatchesClient(myBatch,ev.targetBatch);
+  });
+  const mySubs=(state.evaluationSubmissions||[]).filter(s=>s.userId===me.uid);
+
+  if(!shouldRender('evaluations', {myBatch, availableEvals, mySubs, rules: getPredicateRules()}, force)) return;
+
+  const evalCards=availableEvals.length ? availableEvals.map(ev=>{
+    const sub=mySubs.find(s=>s.evaluationId===ev.id&&s.status==='submitted');
+    const qCount=Array.isArray(ev.questions)?ev.questions.length:0;
+    const progTitle=ev.programTitle||state.programs.find(p=>p.id===ev.programId)?.title||'Program Pelatihan';
+    return `<article class="card" style="border-left:4px solid ${sub?'#087b4b':'#082740'}">
+      <div class="row spread" style="flex-wrap:wrap;gap:6px">
+        <div>
+          <span class="pill" style="font-size:11px">${esc(progTitle)}</span>
+          <span class="pill" style="font-size:11px;background:#fef3c7;color:#92400e">Angkatan: ${esc(ev.targetBatch||'ALL')}</span>
+          <h3 style="margin:6px 0 4px">${esc(ev.title)}</h3>
+        </div>
+        <span class="status ${sub?'approved':'pending'}">${sub?'Sudah Dikerjakan':'Tersedia'}</span>
+      </div>
+      ${ev.description?`<p style="font-size:13px">${esc(ev.description)}</p>`:''}
+      <p style="font-size:13px;color:#475569">Jumlah Soal: <b>${qCount} Pilihan Ganda</b> · Batas Waktu: <b>${Number(ev.durationMinutes||30)} Menit</b></p>
+      ${sub ? `
+        <div class="eval-score-box" style="padding:14px;margin:10px 0">
+          <div class="row spread" style="align-items:center;flex-wrap:wrap;gap:10px">
+            <div>
+              <div style="font-size:11px;opacity:.8">NILAI EVALUASI ANDA</div>
+              <div class="big-score">${esc(sub.score)}<span style="font-size:16px">/100</span></div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-size:11px;opacity:.8">PREDIKAT OTOMATIS</div>
+              <div style="font-size:16px;font-weight:700;color:#fff">${esc(sub.predicate||computeAutoPredicate(sub.score))}</div>
+              <small style="opacity:.85">Benar ${esc(sub.correctCount)}/${esc(sub.totalQuestions)} soal</small>
+            </div>
+          </div>
+        </div>
+        <button type="button" class="button small" data-action="view-eval-recap" data-eval-id="${esc(ev.id)}">Lihat Rekap Jawaban & Pembahasan</button>
+      ` : `
+        <button type="button" class="button green" data-action="start-eval-exam" data-eval-id="${esc(ev.id)}">Mulai Kerjakan Evaluasi (${Number(ev.durationMinutes||30)} Menit)</button>
+      `}
+    </article>`;
+  }).join('') : empty('Belum ada evaluasi digital yang diaktifkan untuk pelatihan & angkatan Anda.');
+
+  root.innerHTML=`
+    <h2>Evaluasi Digital</h2>
+    <p class="muted">Evaluasi pilihan ganda otomatis dihitung sistem dan langsung memperbarui nilai serta predikat sertifikat Anda.</p>
+    ${!myBatch?`<div class="notice" style="border-radius:10px;margin-bottom:14px"><b>Info Angkatan:</b> Angkatan akun Anda belum terisi. Jika evaluasi dibatasi untuk angkatan tertentu, hubungi admin untuk melengkapi data angkatan Anda.</div>`:''}
+    <div class="stack">${evalCards}</div>
+  `;
+}
+
+function openSubmissionRecapModal(sub){
+  const recap=Array.isArray(sub.questionRecap)?sub.questionRecap:[];
+  modal(`Rekap Nilai: ${esc(sub.evaluationTitle||'Evaluasi')}`,`
+    <div class="eval-score-box">
+      <div class="row spread" style="align-items:center;flex-wrap:wrap;gap:12px">
+        <div>
+          <div style="font-size:11px;letter-spacing:1px;opacity:.85">NILAI AKHIR</div>
+          <div class="big-score">${esc(sub.score)}<span style="font-size:18px">/100</span></div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:11px;opacity:.85">PREDIKAT SERTIFIKAT</div>
+          <div style="font-size:18px;font-weight:700">${esc(sub.predicate||computeAutoPredicate(sub.score))}</div>
+          <small>Jawaban Benar: <b>${esc(sub.correctCount)}</b> dari <b>${esc(sub.totalQuestions)}</b> soal</small>
+        </div>
+      </div>
+    </div>
+    ${recap.length ? recap.map((item,idx)=>{
+      const opts=Array.isArray(item.options)?item.options:[];
+      const selText=item.selectedIndex>=0&&opts[item.selectedIndex]!==undefined
+        ? `${String.fromCharCode(65+item.selectedIndex)}. ${opts[item.selectedIndex]}`
+        : 'Tidak dijawab';
+      const corText=opts[item.correctIndex]!==undefined
+        ? `${String.fromCharCode(65+item.correctIndex)}. ${opts[item.correctIndex]}`
+        : '-';
+      return `<div class="eval-recap-item ${item.isCorrect?'correct':'wrong'}">
+        <div style="font-weight:700;margin-bottom:4px">${idx+1}. ${esc(item.questionText)}</div>
+        <div>Jawaban Anda: <b>${esc(selText)}</b> ${item.isCorrect?'<span style="color:#087b4b">✓ Benar</span>':'<span style="color:#c83e51">✗ Kurang Tepat</span>'}</div>
+        ${!item.isCorrect?`<div style="color:#087b4b;margin-top:2px">Kunci Jawaban: <b>${esc(corText)}</b></div>`:''}
+        ${item.explanation?`<div class="muted" style="margin-top:4px">Pembahasan: ${esc(item.explanation)}</div>`:''}
+      </div>`;
+    }).join('') : '<p class="muted">Rekap rincian soal tidak tersedia.</p>'}
+  `);
+}
+
+function defaultQuestionItem(num=1){
+  return {
+    id: 'q_'+uid().slice(0,8),
+    text: '',
+    options: ['', '', '', ''],
+    answerIndex: 0,
+    explanation: ''
+  };
+}
+
+function readBuilderFormIntoState(){
+  const titleEl=$('#eval-title');
+  const progEl=$('#eval-program');
+  const batchEl=$('#eval-batch');
+  const durEl=$('#eval-duration');
+  const descEl=$('#eval-desc');
+  const activeEl=$('#eval-active');
+  const editIdEl=$('#eval-edit-id');
+
+  const meta={
+    editId: editIdEl ? editIdEl.value : '',
+    title: titleEl ? titleEl.value : '',
+    programId: progEl ? progEl.value : '',
+    targetBatch: batchEl ? batchEl.value : 'ALL',
+    durationMinutes: durEl ? Number(durEl.value||30) : 30,
+    description: descEl ? descEl.value : '',
+    active: activeEl ? activeEl.checked : true
+  };
+
+  const cards=[...document.querySelectorAll('.eval-builder-q')];
+  if(cards.length){
+    builderQuestions=cards.map((card,idx)=>{
+      const qId=card.dataset.qid || ('q_'+idx);
+      const qText=card.querySelector('[name="q_text"]')?.value || '';
+      const qExp=card.querySelector('[name="q_exp"]')?.value || '';
+      const ansIdx=Number(card.querySelector('[name="q_ans"]')?.value || 0);
+      const optInputs=[...card.querySelectorAll('[name="q_opt"]')];
+      const options=optInputs.map(inp=>inp.value);
+      return {id:qId,text:qText,options:options.length>=2?options:['',''],answerIndex:ansIdx,explanation:qExp};
+    });
+  }
+  return meta;
+}
+
+function renderEvaluationsAdmin(prefillMeta=null){
+  if(!builderQuestions.length)builderQuestions=[defaultQuestionItem(1)];
+  const meta=prefillMeta||{
+    editId:'',
+    title:'',
+    programId:state.programs[0]?.id||'',
+    targetBatch:'ALL',
+    durationMinutes:30,
+    description:'',
+    active:true
+  };
+
+  const batches=[...new Set([
+    'ALL',
+    ...state.users.map(u=>u.batch).filter(Boolean),
+    ...(state.evaluations||[]).map(e=>e.targetBatch).filter(Boolean)
+  ])];
+  const batchDatalist=batches.map(b=>`<option value="${esc(b)}"></option>`).join('');
+
+  const filteredEvals=(state.evaluations||[]).filter(ev=>{
+    if(evalFilterProg!=='ALL' && ev.programId!==evalFilterProg)return false;
+    if(evalFilterBatch!=='ALL' && String(ev.targetBatch||'ALL').toLowerCase()!==String(evalFilterBatch).toLowerCase())return false;
+    return true;
+  });
+
+  const progOpts=`<option value="">— Pilih Pelatihan —</option>`+state.programs.map(p=>`<option value="${esc(p.id)}" ${meta.programId===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
+  const filterProgOpts=`<option value="ALL">Semua Pelatihan</option>`+state.programs.map(p=>`<option value="${esc(p.id)}" ${evalFilterProg===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
+  const filterBatchOpts=`<option value="ALL">Semua Angkatan</option>`+batches.filter(b=>b!=='ALL').map(b=>`<option value="${esc(b)}" ${evalFilterBatch===b?'selected':''}>${esc(b)}</option>`).join('');
+
+  $('#portal-content').innerHTML=`
+    <h2>Evaluasi Digital (Berbasis Angkatan & Kunci Jawaban)</h2>
+    <p class="muted">Buat soal pilihan ganda beserta kunci jawaban dan batas waktu. Aktifkan per angkatan agar peserta dapat mengerjakan dan mendapatkan nilai + predikat otomatis.</p>
+
+    <form id="eval-builder-form" data-form="save-evaluation-exam" class="card" style="margin-bottom:24px">
+      <div class="row spread" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
+        <h3 style="margin:0">${meta.editId?'Edit Paket Evaluasi Digital':'Buat Paket Evaluasi Digital Baru'}</h3>
+        ${meta.editId?`<button type="button" class="button small ghost" data-action="eval-reset-form">+ Buat Baru (Batal Edit)</button>`:''}
+      </div>
+      <input type="hidden" id="eval-edit-id" name="editId" value="${esc(meta.editId||'')}">
+
+      <div class="grid">
+        <div class="field">
+          <label for="eval-program">Pelatihan Terkait</label>
+          <select id="eval-program" name="programId" required>${progOpts}</select>
+        </div>
+        <div class="field">
+          <label for="eval-batch">Target Angkatan (isi ALL untuk semua angkatan)</label>
+          <input id="eval-batch" name="targetBatch" type="text" list="eval-batch-list" value="${esc(meta.targetBatch||'ALL')}" maxlength="80" placeholder="Contoh: Angkatan I - 2026 atau ALL">
+          <datalist id="eval-batch-list">${batchDatalist}</datalist>
+        </div>
+      </div>
+
+      <div class="grid">
+        ${field('Judul Evaluasi','eval-title','text',meta.title||'','required maxlength="180" placeholder="Contoh: Post-Test & Evaluasi Kompetensi Klinis"')}
+        ${field('Batas Waktu Pengerjaan (Menit)','eval-duration','number',String(meta.durationMinutes||30),'required min="1" max="300" step="1"')}
+      </div>
+
+      ${area('Petunjuk / Deskripsi Evaluasi (opsional)','eval-desc',meta.description||'','maxlength="1500"')}
+
+      <div class="field">
+        <label class="check-label">
+          <input type="checkbox" id="eval-active" name="active" ${meta.active!==false?'checked':''}>
+          <span><b>Aktifkan Evaluasi untuk Peserta</b> (jika dicentang, peserta pada pelatihan & angkatan terkait dapat langsung melihat dan mengerjakan soal)</span>
+        </label>
+      </div>
+
+      <h3 class="section-title" style="margin-top:14px">Daftar Soal Pilihan Ganda & Kunci Jawaban (${builderQuestions.length} Soal)</h3>
+      <div id="eval-questions-list">
+        ${builderQuestions.map((q,qIdx)=>{
+          const opts=Array.isArray(q.options)&&q.options.length>=2?q.options:['','','',''];
+          return `<div class="eval-builder-q" data-qid="${esc(q.id)}">
+            <div class="row spread" style="margin-bottom:8px">
+              <b>Soal Nomor ${qIdx+1}</b>
+              ${builderQuestions.length>1?`<button type="button" class="button small danger" data-action="eval-remove-q" data-idx="${qIdx}">Hapus Soal</button>`:''}
+            </div>
+            <div class="field">
+              <label>Pertanyaan / Kasus Soal</label>
+              <textarea name="q_text" required maxlength="2000" placeholder="Tulis pertanyaan pilihan ganda di sini…">${esc(q.text||'')}</textarea>
+            </div>
+            <div class="grid">
+              ${opts.map((optVal,oIdx)=>`
+                <div class="field" style="margin-bottom:10px">
+                  <label>Pilihan ${String.fromCharCode(65+oIdx)}</label>
+                  <input type="text" name="q_opt" value="${esc(optVal||'')}" required maxlength="600" placeholder="Teks pilihan ${String.fromCharCode(65+oIdx)}">
+                </div>
+              `).join('')}
+            </div>
+            <div class="grid">
+              <div class="field" style="margin-bottom:0">
+                <label>Kunci Jawaban Benar</label>
+                <select name="q_ans">
+                  ${opts.map((_,oIdx)=>`<option value="${oIdx}" ${Number(q.answerIndex)===oIdx?'selected':''}>Pilihan ${String.fromCharCode(65+oIdx)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label>Pembahasan Singkat (opsional)</label>
+                <input type="text" name="q_exp" value="${esc(q.explanation||'')}" maxlength="800" placeholder="Penjelasan jawaban benar">
+              </div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+
+      <div class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:14px">
+        <button type="button" class="button small" data-action="eval-add-q">+ Tambah Soal Pilihan Ganda</button>
+      </div>
+
+      ${submit(meta.editId?'Simpan Perubahan Evaluasi':'Simpan & Publikasikan Evaluasi','green')}
+    </form>
+
+    <div class="row spread" style="flex-wrap:wrap;gap:10px;margin-bottom:12px">
+      <h3 class="section-title" style="margin:0">Daftar Evaluasi & Rekap Nilai Peserta</h3>
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <select id="eval-filter-prog" style="min-width:180px">${filterProgOpts}</select>
+        <select id="eval-filter-batch" style="min-width:160px">${filterBatchOpts}</select>
+      </div>
+    </div>
+
+    <div class="stack">
+      ${filteredEvals.length ? filteredEvals.map(ev=>{
+        const subs=(state.evaluationSubmissions||[]).filter(s=>s.evaluationId===ev.id&&s.status==='submitted');
+        const avgScore=subs.length ? Math.round(subs.reduce((a,b)=>a+Number(b.score||0),0)/subs.length) : null;
+        return `<article class="card" style="border-left:4px solid ${ev.active?'#087b4b':'#94a3b8'}">
+          <div class="row spread" style="flex-wrap:wrap;gap:8px">
+            <div>
+              <b>${esc(ev.title)}</b>
+              <span class="pill" style="font-size:11px;margin-left:6px">${esc(ev.programTitle||'Pelatihan')}</span>
+              <span class="pill" style="font-size:11px;background:#fef3c7;color:#92400e">Angkatan: ${esc(ev.targetBatch||'ALL')}</span>
+              <span class="pill" style="font-size:11px">${Number(ev.durationMinutes||30)} Menit · ${(ev.questions||[]).length} Soal</span>
+            </div>
+            <div class="row" style="gap:6px;flex-wrap:wrap">
+              <button type="button" class="button small ${ev.active?'ghost':'green'}" data-action="eval-toggle-active" data-id="${esc(ev.id)}">${ev.active?'Nonaktifkan':'Aktifkan'}</button>
+              <button type="button" class="button small" data-action="eval-edit-item" data-id="${esc(ev.id)}">Edit</button>
+              <button type="button" class="button small danger" data-action="eval-delete-item" data-id="${esc(ev.id)}">Hapus</button>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px">
+            <div class="row spread" style="margin-bottom:8px;flex-wrap:wrap;gap:6px">
+              <b>Rekap Nilai Otomatis (${subs.length} Peserta Mengumpulkan)</b>
+              ${avgScore!==null?`<span class="pill" style="background:#dcfce7;color:#166534">Rata-rata: ${avgScore}/100</span>`:''}
+            </div>
+            ${subs.length ? subs.map(s=>`
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 8px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:6px;font-size:13px">
+                <div>
+                  <b>${esc(s.userName||'Peserta')}</b> <small class="muted">(${esc(s.userBatch||'Tanpa Angkatan')})</small><br>
+                  Nilai: <b style="color:#087b4b">${esc(s.score)}/100</b> (${esc(s.correctCount)}/${esc(s.totalQuestions)} benar) · Predikat: <b>${esc(s.predicate||computeAutoPredicate(s.score))}</b>
+                </div>
+                <div class="row" style="gap:6px">
+                  <button type="button" class="button small" data-action="view-eval-recap" data-sub-id="${esc(s.id)}">Detail</button>
+                  <button type="button" class="button small danger" data-action="eval-reset-sub" data-eval-id="${esc(ev.id)}" data-user-id="${esc(s.userId)}">Reset Ujian</button>
+                </div>
+              </div>
+            `).join('') : '<p class="muted" style="margin:0;font-size:13px">Belum ada peserta yang mengumpulkan evaluasi ini.</p>'}
+          </div>
+        </article>`;
+      }).join('') : empty('Belum ada evaluasi digital yang dibuat.')}
+    </div>
   `;
 }
 
@@ -1521,7 +1987,7 @@ function renderMemberUKOM(force=false){
       </p>
       ${!bill.isPaidFull ? `
         <div style="background:#fffbeb;border:1px solid #fde68a;padding:10px;border-radius:8px;margin-bottom:10px">
-          ${hasPending?'<small><b>Bukti pembayaran sedang diverifikasi.</b></small>':`<button class="button small" style="background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(bill.remainingBalance)})</button>`}
+          ${hasPending?'<small><b>Bukti pembayaran sedang diverifikasi.</b></small>':`<button class="button small" style="margin-top:8px;background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(bill.remainingBalance)})</button>`}
         </div>
       ` : ''}
       <div style="background:#f8fafc;border:1px solid #e2e8f0;padding:12px;border-radius:10px">
@@ -1696,7 +2162,7 @@ function renderMemberPMK(force=false){
       </p>
       ${!bill.isPaidFull ? `
         <div style="background:#fffbeb;border:1px solid #fde68a;padding:10px;border-radius:8px;margin-bottom:10px">
-          ${hasPending?'<small><b>Bukti pembayaran sedang diverifikasi.</b></small>':`<button class="button small" style="background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(bill.remainingBalance)})</button>`}
+          ${hasPending?'<small><b>Bukti pembayaran sedang diverifikasi.</b></small>':`<button class="button small" style="margin-top:8px;background:#d97706" data-action="pay-installment" data-id="${esc(enr.id)}">Ajukan Pelunasan (${money(bill.remainingBalance)})</button>`}
         </div>
       ` : ''}
       <div style="background:#f8fafc;border:1px solid #e2e8f0;padding:12px;border-radius:10px">
@@ -1950,7 +2416,7 @@ function renderBajuAdmin(force=false){
 }
 
 /* ============================================================================
-5. SERTIFIKAT PESERTA & GENERATOR + CETAK MASSAL / PER ANGKATAN (ADMIN)
+5. SERTIFIKAT PESERTA, KONFIGURASI TTD/PREDIKAT & GENERATOR CETAK MASSAL
    ============================================================================ */
 function renderMemberCertificates(force=false){
   if(!shouldRender('certificates', state.certificates, force)) return;
@@ -1964,7 +2430,7 @@ function renderMemberCertificates(force=false){
     }
     return `<article class="card">
       <h3>${esc(c.title)}</h3>
-      <p>No. <b>${esc(c.serial)}</b> · ${date(c.createdAt)}</p>
+      <p>No. <b>${esc(c.serial)}</b>${c.predicate?` · Predikat: <b>${esc(c.predicate)}</b>`:''} · ${date(c.createdAt)}</p>
       ${img(c.imagePath,'certificate-image','Sertifikat '+c.title)}
       <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px">
         <button class="button green" data-action="download-cert" data-id="${esc(c.id)}">↓ Cetak / Unduh Sertifikat PDF</button>
@@ -1997,20 +2463,29 @@ function renderCertificateEditor(){
     return true;
   });
 
-  const progOpts=`<option value="ALL">Semua Program</option>`+state.programs.map(p=>`<option value="${esc(p.id)}" ${certFilterProg===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
-  const batchOpts=`<option value="ALL">Semua Angkatan / Kelas</option>`+batches.map(b=>`<option value="${esc(b)}" ${certFilterBatch===b?'selected':''}>${esc(b)}</option>`).join('');
+  const cfg=state.cms?.certConfig||{};
+  const rules=getPredicateRules();
+  const selectedProgId=(certFilterProg!=='ALL'?certFilterProg:'') || cfg.defaultProgramId || state.programs[0]?.id || '';
+
+  const progSelectOpts=`<option value="">— Pilih Pelatihan Tersedia —</option>`+
+    state.programs.map(p=>`<option value="${esc(p.id)}" ${selectedProgId===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
+  const progFilterOpts=`<option value="ALL">Semua Program</option>`+
+    state.programs.map(p=>`<option value="${esc(p.id)}" ${certFilterProg===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
+  const batchOpts=`<option value="ALL">Semua Angkatan / Kelas</option>`+
+    batches.map(b=>`<option value="${esc(b)}" ${certFilterBatch===b?'selected':''}>${esc(b)}</option>`).join('');
 
   const candidateRows=filteredPaid.length ? filteredPaid.map((e,idx)=>{
     const u=state.users.find(x=>x.id===e.userId);
     const prog=state.programs.find(x=>x.id===e.programId);
     const title=e.programTitle||prog?.title||'Program';
     const alreadyIssued=state.certificates.some(c=>c.enrollmentId===e.id);
+    const scInfo=resolveParticipantScoreAndPredicate(e);
     return `<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid #e2e8f0;cursor:pointer">
       <div style="display:flex;align-items:center;gap:8px">
         <input type="checkbox" class="cert-pick" value="${esc(e.id)}" ${idx===0?'checked':''}>
         <div>
           <b>${esc(u?.fullTitleName||u?.name||e.userId)}</b> <small class="muted">(${esc(u?.batch||'Tanpa Angkatan')})</small><br>
-          <small>${esc(title)}</small>
+          <small>${esc(title)} · Nilai: <b>${scInfo.score!==null?esc(scInfo.score):'-'}</b> (${esc(scInfo.predicate||'Belum ada nilai')})</small>
         </div>
       </div>
       <span class="status ${alreadyIssued?'approved':'pending'}">${alreadyIssued?'Sudah Terbit':'Belum Terbit'}</span>
@@ -2025,10 +2500,56 @@ function renderCertificateEditor(){
   });
 
   $('#portal-content').innerHTML=`
-    <h2>Generator & Cetak Sertifikat (Satuan / Kelas / Massal)</h2>
+    <h2>Generator & Cetak Sertifikat (Konfigurasi TTD & Predikat Otomatis)</h2>
+
+    <details class="card" style="margin-bottom:16px">
+      <summary style="font-weight:700;cursor:pointer">Simpan Konfigurasi Sertifikat (Penandatangan, TTD, Stempel & Aturan Predikat)</summary>
+      <form data-form="save-cert-config" style="margin-top:12px">
+        <div class="grid">
+          ${field('Nama Penandatangan Tersimpan','signerName','text',cfg.signerName||author,'maxlength="160"')}
+          ${field('Jabatan Penandatangan Tersimpan','signerTitle','text',cfg.signerTitle||'Direktur Haura Institute','maxlength="160"')}
+        </div>
+        <div class="grid">
+          ${field('NIP / NIRA / No. Induk Penandatangan','signerIdNumber','text',cfg.signerIdNumber||'','maxlength="100"')}
+          ${field('Kota Penerbitan Default','city','text',cfg.city||'Lombok Tengah','maxlength="100"')}
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label for="cfg-sign-file">Upload Gambar Tanda Tangan (TTD) Tersimpan</label>
+            <input id="cfg-sign-file" name="signatureFile" type="file" accept="image/jpeg,image/png,image/webp">
+            <div class="sign-preview-box" style="margin-top:6px">
+              ${cfg.signaturePath?`<img src="./assets/logo.png" data-file="${esc(cfg.signaturePath)}" alt="TTD Tersimpan">`:'<span class="muted">Belum ada TTD tersimpan</span>'}
+            </div>
+          </div>
+          <div class="field">
+            <label for="cfg-stamp-file">Upload Gambar Stempel Instansi Tersimpan</label>
+            <input id="cfg-stamp-file" name="stampFile" type="file" accept="image/jpeg,image/png,image/webp">
+            <div class="sign-preview-box" style="margin-top:6px">
+              ${cfg.stampPath?`<img src="./assets/logo.png" data-file="${esc(cfg.stampPath)}" alt="Stempel Tersimpan">`:'<span class="muted">Belum ada stempel tersimpan</span>'}
+            </div>
+          </div>
+        </div>
+        ${area('Redaksi Default Sertifikat (Tetap Bisa Diedit Manual di Form)','bodyTemplate',cfg.bodyTemplate||'Diberikan kepada peserta yang telah menyelesaikan program dan evaluasi dengan baik:','maxlength="3000"')}
+        <div class="grid">
+          ${field('Ambang Predikat Tertinggi (Nilai >=)','minA','number',String(rules.minA),'min="0" max="100" step="1"')}
+          ${field('Label Predikat Tertinggi','labelA','text',rules.labelA,'maxlength="60"')}
+        </div>
+        <div class="grid">
+          ${field('Ambang Predikat Kedua (Nilai >=)','minB','number',String(rules.minB),'min="0" max="100" step="1"')}
+          ${field('Label Predikat Kedua','labelB','text',rules.labelB,'maxlength="60"')}
+        </div>
+        <div class="grid">
+          ${field('Ambang Predikat Ketiga (Nilai >=)','minC','number',String(rules.minC),'min="0" max="100" step="1"')}
+          ${field('Label Predikat Ketiga & Di Bawahnya','labelC','text',rules.labelC,'maxlength="60"')}
+        </div>
+        ${field('Label Predikat Terendah (Di Bawah Ambang Ketiga)','labelD','text',rules.labelD,'maxlength="60"')}
+        ${submit('Simpan Konfigurasi Sertifikat Permanen','green')}
+      </form>
+    </details>
+
     <div class="card" style="margin-bottom:16px">
       <div class="row" style="gap:10px;flex-wrap:wrap;align-items:end">
-        <div class="field" style="margin:0;flex:1;min-width:200px"><label for="cert-filter-prog">Filter Program</label><select id="cert-filter-prog">${progOpts}</select></div>
+        <div class="field" style="margin:0;flex:1;min-width:200px"><label for="cert-filter-prog">Filter Program</label><select id="cert-filter-prog">${progFilterOpts}</select></div>
         <div class="field" style="margin:0;flex:1;min-width:200px"><label for="cert-filter-batch">Filter Angkatan / Kelas</label><select id="cert-filter-batch">${batchOpts}</select></div>
         <div class="row" style="gap:6px">
           <button type="button" class="button small" data-action="cert-select-all">Pilih Semua (${filteredPaid.length})</button>
@@ -2046,18 +2567,26 @@ function renderCertificateEditor(){
         ${field('Nama Institusi','heading','text','HAURA INSTITUTE','required maxlength="80"')}
         ${field('Subjudul','subtitle','text','Center of Medical Excellence','maxlength="100"')}
         ${field('Kalimat Pembuka','intro','text','Diberikan kepada:','maxlength="150"')}
-        ${field('Kalimat Penghargaan','body','text','Atas partisipasinya dalam program pelatihan:','maxlength="180"')}
-        ${field('Nama Pelatihan (kosongkan untuk otomatis mengikuti program)','course','text','','maxlength="150"')}
-        <div class="field"><label for="pred">Predikat</label><select id="pred" name="predicate"><option>EXCELLENT</option><option>VERY GOOD</option><option>GOOD</option><option>PARTICIPANT</option></select></div>
-        ${field('Tempat','place','text','Lombok Tengah','maxlength="60"')}
+        ${field('Redaksi / Isi Teks Sertifikat (Dapat Diubah Manual)','body','text',cfg.bodyTemplate||'Atas partisipasinya dalam program pelatihan:','maxlength="300"')}
+        <div class="field">
+          <label for="cert-program-select">Pilihan Pelatihan Tersedia</label>
+          <select id="cert-program-select" name="programSelectId">${progSelectOpts}</select>
+        </div>
+        ${field('Judul Pelatihan di Sertifikat (Opsional — Timpa Teks Pilihan Pelatihan)','course','text','','maxlength="150" placeholder="Kosongkan untuk memakai nama pelatihan terpilih"')}
+        <div class="field">
+          <label for="pred">Predikat Sertifikat (Otomatis dari Nilai Evaluasi)</label>
+          <input id="pred" name="predicate" type="text" readonly value="${esc(computeAutoPredicate(85))}" style="background:#f1f5f9;font-weight:700;color:#087b4b">
+          <small class="muted">Terisi otomatis mengikuti nilai akhir evaluasi peserta pada tiap sertifikat.</small>
+        </div>
+        ${field('Tempat','place','text',cfg.city||'Lombok Tengah','maxlength="60"')}
         ${field('Tanggal Terbit','issued','date',new Date().toISOString().slice(0,10),'required')}
         ${field('Logo Utama','main','file','','accept="image/jpeg,image/png,image/webp" data-cert-image="main"')}
         ${field('Logo Mitra (opsional)','partner','file','','accept="image/jpeg,image/png,image/webp" data-cert-image="partner"')}
         ${field('Nama Penandatangan Kiri','leftName','text','','maxlength="100"')}
         ${field('Jabatan Kiri','leftTitle','text','','maxlength="100"')}
         ${field('Tanda Tangan Kiri','left','file','','accept="image/jpeg,image/png,image/webp" data-cert-image="left"')}
-        ${field('Nama Penandatangan Kanan','rightName','text',author,'maxlength="100"')}
-        ${field('Jabatan Kanan','rightTitle','text','Direktur Haura Institute','maxlength="100"')}
+        ${field('Nama Penandatangan Kanan','rightName','text',cfg.signerName||author,'maxlength="100"')}
+        ${field('Jabatan Kanan','rightTitle','text',cfg.signerTitle||'Direktur Haura Institute','maxlength="100"')}
         ${field('Tanda Tangan Kanan','right','file','','accept="image/jpeg,image/png,image/webp" data-cert-image="right"')}
         ${submit('Terbitkan & Cetak PDF Terpilih','green')}
         <p><button class="button" type="button" data-action="preview-pdf">Unduh Preview 1 Halaman PDF</button></p>
@@ -2078,7 +2607,7 @@ function renderCertificateEditor(){
         return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #e2e8f0;flex-wrap:wrap">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
             <input type="checkbox" class="issued-pick" value="${esc(c.id)}">
-            <span><b>${esc(c.serial)}</b> — ${esc(u?.fullTitleName||u?.name||c.userId)} (${esc(c.title)})</span>
+            <span><b>${esc(c.serial)}</b> — ${esc(u?.fullTitleName||u?.name||c.userId)} (${esc(c.title)})${c.predicate?` · <b>${esc(c.predicate)}</b>`:''}</span>
           </label>
           <div class="row" style="gap:6px">
             <button type="button" class="button small" data-action="verify-cert-preview" data-serial="${esc(c.serial)}">Cek QR</button>
@@ -2088,10 +2617,36 @@ function renderCertificateEditor(){
       }).join('') : empty('Belum ada sertifikat terbit pada filter ini.')}
     </div>
   `;
+
+  (async()=>{
+    const cfgPath=state.cms?.certConfig?.signaturePath;
+    if(cfgPath && !certImages.right && B?.storageConfigured && !isOffline()){
+      try{
+        certImages.right=await B.fileURL(cfgPath);
+        updateCertificate();
+      }catch{}
+    }
+    const stampPath=state.cms?.certConfig?.stampPath;
+    if(stampPath && !certImages.stamp && B?.storageConfigured && !isOffline()){
+      try{
+        certImages.stamp=await B.fileURL(stampPath);
+        updateCertificate();
+      }catch{}
+    }
+  })();
+
   updateCertificate();
 }
 
 function certificateData(){const f=$('#certificate-form');return f?Object.fromEntries(new FormData(f)):{};}
+function resolveCertificateCourseTitle(c, enr, prog){
+  const manualOverride=(c.course||'').trim();
+  if(manualOverride)return manualOverride;
+  const chosenProg=c.programSelectId ? state.programs.find(p=>p.id===c.programSelectId) : null;
+  if(chosenProg?.title)return chosenProg.title;
+  return enr?.programTitle || prog?.title || 'Nama Program Pelatihan';
+}
+
 function updateCertificate(overrideEnr=null, overrideSerial=null){
   const el=$('#certificate-preview');if(!el)return;
   const c=certificateData();
@@ -2099,7 +2654,12 @@ function updateCertificate(overrideEnr=null, overrideSerial=null){
   const enr=overrideEnr||(checkedEl?state.enrollments.find(e=>e.id===checkedEl.value):null);
   const u=enr?state.users.find(x=>x.id===enr.userId):null;
   const prog=enr?state.programs.find(x=>x.id===enr.programId):null;
-  const courseName=(c.course||'').trim()||(enr?.programTitle||prog?.title||'Nama Program Pelatihan');
+  const courseName=resolveCertificateCourseTitle(c, enr, prog);
+  const scoreInfo=enr ? resolveParticipantScoreAndPredicate(enr) : {score:85,predicate:computeAutoPredicate(85)};
+  const predicateLabel=scoreInfo.predicate || computeAutoPredicate(scoreInfo.score) || 'Memuaskan';
+  const predInput=$('#pred');
+  if(predInput && !overrideEnr)predInput.value=predicateLabel;
+
   const serial=overrideSerial||c.serial||nextAutoSerial(0);
   const qrDataUrl=makeQrDataUrl(certVerifyURL(serial));
   const issuedFmt=c.issued?new Date(c.issued+'T12:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'}):'';
@@ -2108,19 +2668,19 @@ function updateCertificate(overrideEnr=null, overrideSerial=null){
   el.innerHTML=`
     <div>
       <div class="cert-logos"><img src="${esc(certImages.main)}" alt="Logo">${certImages.partner?`<img src="${esc(certImages.partner)}" alt="Mitra">`:''}</div>
-      <h2>${esc(c.heading)}</h2>
-      <span class="cert-sub">${esc(c.subtitle)}</span>
+      <h2>${esc(c.heading||'HAURA INSTITUTE')}</h2>
+      <span class="cert-sub">${esc(c.subtitle||'Center of Medical Excellence')}</span>
     </div>
     <div>
-      <p>${esc(c.intro)}</p>
+      <p>${esc(c.intro||'Diberikan kepada:')}</p>
       <h3>${esc(u?.fullTitleName||u?.name||'Nama Peserta')}</h3>
       <p>${esc(u?.institution||'Instansi Peserta')}</p>
-      <p>${esc(c.body)}</p>
+      <p>${esc(c.body||'Atas partisipasinya dalam program pelatihan:')}</p>
       <div class="cert-course">${esc(courseName)}</div>
-      <p>Predikat: <b>${esc(c.predicate)}</b></p>
+      <div class="cert-predicate">Predikat: ${esc(predicateLabel)}${scoreInfo.score!==null?` (Nilai: ${esc(scoreInfo.score)})`:''}</div>
     </div>
     <div style="width:100%">
-      <p>${esc(c.place)}, ${esc(issuedFmt)}</p>
+      <p>${esc(c.place||'Lombok Tengah')}, ${esc(issuedFmt)}</p>
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px">
         <div style="text-align:center;min-width:96px">
           <img src="${qrDataUrl}" alt="QR Verifikasi" style="width:76px;height:76px;border:1px solid #cbd5e1;padding:3px;background:#fff;border-radius:6px">
@@ -2345,6 +2905,7 @@ function renderFinanceAdmin(force=false){
     const prog=state.programs.find(x=>x.id===enr.programId);
     const st=HauraFinance.statusLabel(enr);
     const bill=HauraFinance.billingBreakdown(enr);
+    const scInfo=resolveParticipantScoreAndPredicate(enr);
 
     const payRows=(enr.payments||[]).map(p=>`
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;margin-top:6px">
@@ -2375,7 +2936,7 @@ function renderFinanceAdmin(force=false){
         Total Biaya: <b>${money(bill.billedTotal)}</b> ·
         Terbayar: <b style="color:#087b4b">${money(bill.paidAmount)} (${bill.percentPaid}%)</b> ·
         Sisa Tagihan: <b style="color:${bill.remainingBalance>0?'#b45309':'#087b4b'}">${money(bill.remainingBalance)}</b> ·
-        Nilai: <b>${enr.score!==null&&enr.score!==undefined?esc(enr.score):'-'}</b>
+        Nilai: <b>${scInfo.score!==null?esc(scInfo.score):'-'}</b>${scInfo.predicate?` (${esc(scInfo.predicate)})`:''}
       </p>
       <div style="background:#f8fafc;padding:8px;border-radius:8px;margin-bottom:10px">
         ${payRows||'<p class="muted">Belum ada catatan pembayaran.</p>'}
@@ -2956,6 +3517,8 @@ async function doAction(action,el){
       throw new Error('Mode offline aktif. Hanya menu Buku Digital yang dapat dibuka tanpa internet.');
     }
     if(isOffline()) memberBooksAccess(); else member();
+    stopEvalCountdown();
+    activeEvalSession=null;
     chatStop?.();chatStop=null;
     tab=el.dataset.id;
     tabsRender(true);
@@ -2965,6 +3528,113 @@ async function doAction(action,el){
   if(action==='chat-subtab'){member();chatSubTab=el.dataset.id;renderMemberChatAndAlkes(true);hydrate();return;}
   if(action==='alkes-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);alkesCart[id]=Math.max(0,(Number(alkesCart[id]||0)+delta));renderMemberChatAndAlkes(true);hydrate();return;}
   if(action==='baju-qty'){member();const id=el.dataset.id,delta=Number(el.dataset.delta||0);bajuCart[id]=Math.max(0,(Number(bajuCart[id]||0)+delta));renderMemberBaju(true);hydrate();return;}
+
+  if(action==='start-eval-exam'){
+    member();
+    const evalId=el.dataset.evalId;
+    const ev=(state.evaluations||[]).find(x=>x.id===evalId);
+    if(!ev)throw new Error('Evaluasi tidak ditemukan.');
+    const startRes=await B.startEvaluation({evaluationId:evalId});
+    if(startRes?.alreadySubmitted && startRes.submission){
+      return openSubmissionRecapModal(startRes.submission);
+    }
+    activeEvalSession={
+      evaluation:ev,
+      startedAtMs:Number(startRes?.startedAtMs||getTrustedTimeMs()),
+      expiresAtMs:Number(startRes?.expiresAtMs||(getTrustedTimeMs()+Number(ev.durationMinutes||30)*60000)),
+      answers:{}
+    };
+    renderActiveExamRunner($('#portal-content'));
+    return;
+  }
+  if(action==='cancel-eval-runner'){
+    stopEvalCountdown();
+    activeEvalSession=null;
+    renderMemberEvaluations(true);
+    return;
+  }
+  if(action==='view-eval-recap'){
+    member();
+    let sub=null;
+    if(el.dataset.subId){
+      sub=(state.evaluationSubmissions||[]).find(s=>s.id===el.dataset.subId);
+    }else if(el.dataset.evalId){
+      sub=(state.evaluationSubmissions||[]).find(s=>s.userId===me.uid&&s.evaluationId===el.dataset.evalId&&s.status==='submitted');
+    }
+    if(!sub)throw new Error('Rekap jawaban tidak ditemukan.');
+    return openSubmissionRecapModal(sub);
+  }
+
+  if(action==='eval-add-q'){
+    adminOnly();
+    const meta=readBuilderFormIntoState();
+    builderQuestions.push(defaultQuestionItem(builderQuestions.length+1));
+    renderEvaluationsAdmin(meta);
+    return;
+  }
+  if(action==='eval-remove-q'){
+    adminOnly();
+    const meta=readBuilderFormIntoState();
+    const idx=Number(el.dataset.idx);
+    if(builderQuestions.length>1 && idx>=0 && idx<builderQuestions.length){
+      builderQuestions.splice(idx,1);
+    }
+    renderEvaluationsAdmin(meta);
+    return;
+  }
+  if(action==='eval-reset-form'){
+    adminOnly();
+    builderQuestions=[defaultQuestionItem(1)];
+    renderEvaluationsAdmin(null);
+    return;
+  }
+  if(action==='eval-edit-item'){
+    adminOnly();
+    const ev=(state.evaluations||[]).find(x=>x.id===el.dataset.id);
+    if(!ev)throw new Error('Evaluasi tidak ditemukan.');
+    builderQuestions=Array.isArray(ev.questions)&&ev.questions.length
+      ? ev.questions.map((q,i)=>({
+          id:q.id||('q_'+i),
+          text:q.text||'',
+          options:Array.isArray(q.options)&&q.options.length>=2?q.options.slice():['','','',''],
+          answerIndex:Number(q.answerIndex||0),
+          explanation:q.explanation||''
+        }))
+      : [defaultQuestionItem(1)];
+    renderEvaluationsAdmin({
+      editId:ev.id,
+      title:ev.title||'',
+      programId:ev.programId||'',
+      targetBatch:ev.targetBatch||'ALL',
+      durationMinutes:Number(ev.durationMinutes||30),
+      description:ev.description||'',
+      active:ev.active===true
+    });
+    return;
+  }
+  if(action==='eval-toggle-active'){
+    adminOnly();
+    const ev=(state.evaluations||[]).find(x=>x.id===el.dataset.id);
+    if(!ev)throw new Error('Evaluasi tidak ditemukan.');
+    await B.patch('evaluations',ev.id,{active:!ev.active,updatedAt:B.stamp()});
+    ev.active=!ev.active;
+    renderEvaluationsAdmin();
+    return toast(ev.active?'Evaluasi diaktifkan untuk peserta.':'Evaluasi dinonaktifkan.');
+  }
+  if(action==='eval-delete-item'){
+    adminOnly();
+    await B.remove('evaluations',el.dataset.id);
+    state.evaluations=(state.evaluations||[]).filter(x=>x.id!==el.dataset.id);
+    renderEvaluationsAdmin();
+    return toast('Evaluasi dihapus.');
+  }
+  if(action==='eval-reset-sub'){
+    adminOnly();
+    await B.resetEvaluationSubmission({evaluationId:el.dataset.evalId,userId:el.dataset.userId});
+    state.evaluationSubmissions=(state.evaluationSubmissions||[]).filter(s=>!(s.evaluationId===el.dataset.evalId&&s.userId===el.dataset.userId));
+    renderEvaluationsAdmin();
+    return toast('Status pengerjaan peserta direset.');
+  }
 
   if(action==='open-receipt'){
     const enr=state.enrollments.find(e=>e.id===el.dataset.enr);
@@ -2984,7 +3654,7 @@ async function doAction(action,el){
       paidAmount: bill.paidAmount,
       remainingBalance: bill.remainingBalance,
       confirmedAt: pay.confirmedAt||pay.submittedAt,
-      receiverName: author
+      receiverName: state.cms?.certConfig?.signerName || author
     });
     return;
   }
@@ -3032,73 +3702,128 @@ async function doAction(action,el){
   if(action==='cash-payment-modal'){adminOnly();return openCashPaymentModal(el.dataset.id);}
   if(action==='direct-cash-enroll-modal'){adminOnly();return openDirectCashEnrollModal();}
   if(action==='review-payment'){adminOnly();return openReviewPaymentModal(el.dataset.enr,el.dataset.pay);}
-  if(action==='confirm-payment'||action==='reject-payment'){
-    adminOnly();
-    const note=$('#reviewNote')?.value||'';
-    if(action==='reject-payment'&&!note.trim())throw new Error('Isi alasan penolakan.');
-    const res = await B.confirmPayment({enrollmentId:el.dataset.enr,paymentId:el.dataset.pay,decision:action==='confirm-payment'?'confirmed':'rejected',note});
-    close();
-    if(action==='confirm-payment' && res?.receiptNumber){
-      toast(`Pembayaran dikonfirmasi. Kuitansi ${res.receiptNumber} terbit.`);
-    }else{
-      toast(action==='confirm-payment'?'Pembayaran dikonfirmasi.':'Bukti ditolak.');
-    }
-    return;
-  }
   if(action==='review-access-pay'){adminOnly();return openReviewAccessPayModal(el.dataset.id);}
-  if(action==='confirm-access-pay'||action==='reject-access-pay'){
-    adminOnly();
-    const note=$('#reviewNote')?.value||'';
-    await B.reviewAccessPayment({paymentId:el.dataset.id,decision:action==='confirm-access-pay'?'confirmed':'rejected',note});
-    close();
-    return toast(action==='confirm-access-pay'?'Paket akses diaktifkan.':'Pembayaran ditolak.');
-  }
+  if(action==='review-chat-pay'){adminOnly();return openReviewChatPayModal(el.dataset.id);}
+  if(action==='review-alkes-order'){adminOnly();return openReviewAlkesOrderModal(el.dataset.id);}
+  if(action==='review-donation'){adminOnly();return openReviewDonationModal(el.dataset.id);}
+  if(action==='grade-enrollment'){adminOnly();return openGradeModal(el.dataset.id);}
   if(action==='admin-grant-access'){adminOnly();return openGrantAccessModal(el.dataset.id);}
 
-  if(action==='review-donation'){adminOnly();return openReviewDonationModal(el.dataset.id);}
-  if(action==='confirm-donation'||action==='reject-donation'){
+  if(action==='confirm-payment'){
     adminOnly();
-    const note=$('#reviewNote')?.value||'';
-    await B.reviewDonation({donationId:el.dataset.id,decision:action==='confirm-donation'?'confirmed':'rejected',note});
+    const note=$('#reviewNote')?.value.trim()||'';
+    const res=await B.confirmPayment({enrollmentId:el.dataset.enr,paymentId:el.dataset.pay,note});
     close();
-    return toast(action==='confirm-donation'?'Donasi amal dikonfirmasi.':'Donasi ditolak.');
+    return toast(res?.receiptNumber?`Pembayaran sah! No. Kuitansi: ${res.receiptNumber}`:'Pembayaran dikonfirmasi.');
+  }
+  if(action==='reject-payment'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'Bukti belum sesuai.';
+    await B.rejectPayment({enrollmentId:el.dataset.enr,paymentId:el.dataset.pay,note});
+    close();
+    return toast('Bukti pembayaran ditolak.');
+  }
+  if(action==='confirm-access-pay'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'';
+    const res=await B.confirmAccessPayment({paymentId:el.dataset.id,note});
+    close();
+    return toast(res?.receiptNumber?`Paket akses aktif! No. Kuitansi: ${res.receiptNumber}`:'Paket akses diaktifkan.');
+  }
+  if(action==='reject-access-pay'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'Bukti belum sesuai.';
+    await B.rejectAccessPayment({paymentId:el.dataset.id,note});
+    close();
+    return toast('Pembayaran paket akses ditolak.');
+  }
+  if(action==='confirm-chat-pay'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'';
+    await B.confirmChatPayment({paymentId:el.dataset.id,note});
+    close();
+    return toast('Langganan diskusi diaktifkan.');
+  }
+  if(action==='reject-chat-pay'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'Bukti belum sesuai.';
+    await B.rejectChatPayment({paymentId:el.dataset.id,note});
+    close();
+    return toast('Pembayaran diskusi ditolak.');
+  }
+  if(action==='confirm-alkes-order'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'';
+    await B.confirmAlkesOrder({orderId:el.dataset.id,note});
+    close();
+    return toast('Pesanan dikonfirmasi.');
+  }
+  if(action==='reject-alkes-order'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'Bukti belum sesuai.';
+    await B.rejectAlkesOrder({orderId:el.dataset.id,note});
+    close();
+    return toast('Pesanan ditolak.');
+  }
+  if(action==='confirm-donation'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'';
+    await B.confirmDonation({donationId:el.dataset.id,note});
+    close();
+    return toast('Donasi amal dikonfirmasi.');
+  }
+  if(action==='reject-donation'){
+    adminOnly();
+    const note=$('#reviewNote')?.value.trim()||'Bukti belum sesuai.';
+    await B.rejectDonation({donationId:el.dataset.id,note});
+    close();
+    return toast('Donasi amal ditolak.');
   }
 
+  if(action==='remove-qris'){
+    adminOnly();
+    if(state.cms.qrisPath)await B.removeFile(state.cms.qrisPath).catch(()=>{});
+    await B.saveCMS({...state.cms,qrisPath:''});
+    renderFinanceAdmin(true);
+    return toast('QRIS dihapus.');
+  }
+  if(action==='reset-logo'){
+    adminOnly();
+    if(state.cms.logoPath)await B.removeFile(state.cms.logoPath).catch(()=>{});
+    await B.saveCMS({...state.cms,logoPath:''});
+    applyBrandLogos();
+    renderCMS();
+    return toast('Logo dikembalikan ke bawaan.');
+  }
+  if(action==='remove-video'){
+    adminOnly();
+    if(state.cms.videoPath)await B.removeFile(state.cms.videoPath).catch(()=>{});
+    await B.saveCMS({...state.cms,videoPath:''});
+    publicRender();
+    renderCMS();
+    return toast('Video beranda dihapus.');
+  }
   if(action==='remove-banner'){
     adminOnly();
-    const list=(state.cms.banners||[]).filter(b=>b.id!==el.dataset.id);
-    await B.patch('settings','public',{banners:list,updatedAt:B.stamp()});
-    state.cms.banners=list;
+    const b=(state.cms.banners||[]).find(x=>x.id===el.dataset.id);
+    if(b?.imagePath)await B.removeFile(b.imagePath).catch(()=>{});
+    const nextBanners=(state.cms.banners||[]).filter(x=>x.id!==el.dataset.id);
+    await B.saveCMS({...state.cms,banners:nextBanners});
     renderTopBannerSlider();
     renderCMS();
     return toast('Foto banner dihapus.');
   }
+  if(action==='archive-alkes'){adminOnly();await B.patch('alkes',el.dataset.id,{archived:true});return toast('Item diarsipkan.');}
+  if(action==='delete-expense'){adminOnly();await B.remove('expenses',el.dataset.id);return toast('Pengeluaran dihapus.');}
 
-  if(action==='review-chat-pay'){adminOnly();return openReviewChatPayModal(el.dataset.id);}
-  if(action==='confirm-chat-pay'||action==='reject-chat-pay'){
-    adminOnly();
-    const note=$('#reviewNote')?.value||'';
-    await B.reviewChatPayment({paymentId:el.dataset.id,decision:action==='confirm-chat-pay'?'confirmed':'rejected',note});
-    close();
-    return toast(action==='confirm-chat-pay'?'Akses diskusi diaktifkan.':'Pembayaran ditolak.');
-  }
-  if(action==='review-alkes-order'){adminOnly();return openReviewAlkesOrderModal(el.dataset.id);}
-  if(action==='confirm-alkes-order'||action==='reject-alkes-order'){
-    adminOnly();
-    const note=$('#reviewNote')?.value||'';
-    await B.reviewAlkesOrder({orderId:el.dataset.id,decision:action==='confirm-alkes-order'?'confirmed':'rejected',note});
-    close();
-    return toast(action==='confirm-alkes-order'?'Pesanan dikonfirmasi.':'Pesanan ditolak.');
-  }
-  if(action==='grade-enrollment'){adminOnly();return openGradeModal(el.dataset.id);}
-  if(action==='delete-expense'){adminOnly();await B.removeExpense(el.dataset.id);return toast('Pengeluaran dihapus.');}
-  if(action==='archive-alkes'){adminOnly();await B.patch('alkes',el.dataset.id,{published:false});return toast('Produk diarsipkan.');}
-  if(action==='reset-logo'){adminOnly();await B.patch('settings','public',{logoPath:'',updatedAt:B.stamp()});return toast('Logo dikembalikan.');}
-  if(action==='remove-video'){adminOnly();await B.patch('settings','public',{videoPath:'',updatedAt:B.stamp()});return toast('Video dihapus.');}
-  if(action==='remove-qris'){adminOnly();await B.patch('settings','public',{qrisPath:'',updatedAt:B.stamp()});return toast('QRIS dihapus.');}
-  if(action==='sbar'){member();if(!hasEffectiveChatAccess())throw new Error('Akses diskusi belum aktif.');return sbarForm();}
-  if(action==='open-chat'){adminOnly();const u=state.users.find(u=>u.id===el.dataset.id);createRoom(u.id,u.fullTitleName||u.name);return renderChatUsers(true);}
-  if(action==='older-chat'){ready();messageLimit=Math.min(messageLimit+100,1000);watchMessages();return;}
+  if(action==='approve-user'||action==='reject-user'){adminOnly();await B.setMemberStatus(el.dataset.id,action==='approve-user'?'approved':'rejected');return toast('Status peserta diperbarui.');}
+  if(action==='delete-module'){adminOnly();const b=state.ebooks.find(x=>x.id===el.dataset.id);await B.remove('ebooks',el.dataset.id);if(b?.htmlPath)await B.removeFile(b.htmlPath).catch(()=>{});return toast('Buku dihapus.');}
+  if(action==='edit-program'){adminOnly();const p=state.programs.find(x=>x.id===el.dataset.id);return modal('Edit Program',`<form data-form="edit-program" data-id="${esc(p.id)}">${field('Nama Program','title','text',p.title,'required maxlength="180"')}${area('Deskripsi','description',p.description,'required maxlength="3000"')}${field('Total Biaya (Rp)','totalFee','number',String(HauraFinance.programFee(p)),'required min="1000" step="1000"')}${field('Minimal Bayar / DP (Rp)','minDownPayment','number',String(HauraFinance.programMinDp(p)),'required min="0" step="1000"')}${submit('Simpan')}</form>`);}
+  if(action==='archive-program'){adminOnly();await B.patch('programs',el.dataset.id,{archived:true});return toast('Program diarsipkan.');}
+  if(action==='archive-news'){adminOnly();await B.patch('news',el.dataset.id,{archived:true});return toast('Berita diarsipkan.');}
+  if(action==='open-chat'){adminOnly();createRoom(el.dataset.id,state.users.find(u=>u.id===el.dataset.id)?.name||'Peserta');renderChatUsers(true);return;}
+  if(action==='older-chat'){member();messageLimit+=100;watchMessages();return;}
+  if(action==='sbar'){member();return sbarForm();}
 
   if(action==='cert-select-all'){document.querySelectorAll('.cert-pick').forEach(cb=>cb.checked=true);updateCertificate();return;}
   if(action==='cert-unselect-all'){document.querySelectorAll('.cert-pick').forEach(cb=>cb.checked=false);updateCertificate();return;}
@@ -3106,768 +3831,1111 @@ async function doAction(action,el){
   if(action==='verify-cert-preview'){
     const serial=el.dataset.serial;
     const idx=state.cms?.certIndex||{};
-    const rec=idx[serial];
-    if(!rec)throw new Error('Data verifikasi sertifikat belum tercatat.');
-    modal('Verifikasi Orisinalitas Sertifikat',`
-      <div style="background:#ecfdf5;border:2px solid #059669;border-radius:12px;padding:14px">
-        <span style="background:#059669;color:#fff;font-weight:800;padding:3px 9px;border-radius:999px;font-size:12px">✓ TERVERIFIKASI ASLI</span>
-        <p style="margin:8px 0;font-size:14px;color:#064e3b"><b>Pernyataan Resmi Haura Institute:</b> Sertifikat dengan Nomor <b>${esc(rec.serial)}</b> atas nama <b>${esc(rec.name)}</b> (${esc(rec.course)}) adalah <b>BENAR dan SAH</b>.</p>
-        <p style="font-size:12px;margin:0;color:#065f46">Tautan Scan QR: <br><code style="word-break:break-all">${esc(certVerifyURL(rec.serial))}</code></p>
+    const rec=idx[serial]||state.certificates.find(c=>c.serial===serial);
+    if(!rec)throw new Error('Data sertifikat tidak ditemukan.');
+    modal('Pratinjau QR Verifikasi Sertifikat',`
+      <div style="text-align:center">
+        <p style="font-size:13px"><b>No. Sertifikat:</b> ${esc(rec.serial)}<br><b>Pemilik:</b> ${esc(rec.name||'')}</p>
+        <img src="${makeQrDataUrl(certVerifyURL(rec.serial))}" alt="QR Code" style="width:180px;height:180px;border:1px solid #cbd5e1;padding:6px;background:#fff;border-radius:10px">
+        <p class="muted" style="font-size:12px;word-break:break-all;margin-top:8px">${esc(certVerifyURL(rec.serial))}</p>
       </div>
     `);
     return;
   }
+
+  if(action==='preview-pdf'){
+    toast('Menyiapkan PDF…');
+    updateCertificate();
+    await pdfDownload((await captureCertificate()).toDataURL('image/jpeg',.92),'Preview_Sertifikat');
+    return;
+  }
   if(action==='download-cert'){
     member();
-    const c=state.certificates.find(c=>c.id===el.dataset.id);
-    if(!c||c.locked)throw new Error('Sertifikat terkunci.');
-    const url=await B.fileURL(c.imagePath);
-    const response=await fetch(url);
-    const source=await blobData(await response.blob());
-    await pdfDownload(source,`${c.serial}_${c.title}`);
+    const cert=state.certificates.find(x=>x.id===el.dataset.id);
+    if(!cert||cert.locked)throw new Error('Sertifikat terkunci.');
+    toast('Menyiapkan PDF sertifikat…');
+    let imgSrc='';
+    if(cert.imagePath && !isOffline()){
+      try{ imgSrc=await B.fileURL(cert.imagePath); }catch{}
+    }
+    if(!imgSrc){
+      const node=$('#certificate-preview');
+      const qrImg=makeQrDataUrl(certVerifyURL(cert.serial));
+      const sigPath=state.cms?.certConfig?.signaturePath;
+      let sigUrl='';
+      if(sigPath && !isOffline()){ try{ sigUrl=await B.fileURL(sigPath); }catch{} }
+      const issuedFmt=cert.createdAt?new Date(cert.createdAt?.toDate?cert.createdAt.toDate():cert.createdAt).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'}):'';
+      node.innerHTML=`
+        <div>
+          <div class="cert-logos"><img src="${esc(certImages.main)}" alt="Logo"></div>
+          <h2>HAURA INSTITUTE</h2>
+          <span class="cert-sub">Center of Medical Excellence</span>
+        </div>
+        <div>
+          <p>Diberikan kepada:</p>
+          <h3>${esc(profile?.fullTitleName||profile?.name||'Peserta')}</h3>
+          <p>${esc(profile?.institution||'')}</p>
+          <p>${esc(state.cms?.certConfig?.bodyTemplate||'Atas partisipasinya dalam program pelatihan:')}</p>
+          <div class="cert-course">${esc(cert.title||'Program')}</div>
+          ${cert.predicate?`<div class="cert-predicate">Predikat: ${esc(cert.predicate)}</div>`:''}
+        </div>
+        <div style="width:100%">
+          <p>${esc(state.cms?.certConfig?.city||'Lombok Tengah')}, ${esc(issuedFmt)}</p>
+          <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px">
+            <div style="text-align:center;min-width:96px">
+              <img src="${qrImg}" alt="QR Verifikasi" style="width:76px;height:76px;border:1px solid #cbd5e1;padding:3px;background:#fff;border-radius:6px">
+              <div style="font-size:8.5px;color:#475569;margin-top:2px">Scan Verifikasi</div>
+            </div>
+            <div class="cert-signatures" style="flex:1"><div>${sigUrl?`<img src="${esc(sigUrl)}" alt="TTD">`:'<div class="signature-space"></div>'}<b>${esc(state.cms?.certConfig?.signerName||author)}</b><span>${esc(state.cms?.certConfig?.signerTitle||'Direktur Haura Institute')}</span></div></div>
+          </div>
+          <p class="cert-meta">No. ${esc(cert.serial)} · Haura Institute</p>
+        </div>
+      `;
+      const canvas=await captureCertificate();
+      await pdfDownload(canvas.toDataURL('image/jpeg',.92),`Sertifikat_${cert.serial}`);
+      return;
+    }
+    const image=new Image();
+    image.src=imgSrc;
+    await image.decode();
+    await pdfDownload(image,`Sertifikat_${cert.title}`);
     return;
   }
   if(action==='admin-print-one-cert'){
     adminOnly();
-    const c=state.certificates.find(x=>x.id===el.dataset.id);
-    if(!c)throw new Error('Sertifikat tidak ditemukan.');
+    const cert=state.certificates.find(x=>x.id===el.dataset.id);
+    if(!cert)throw new Error('Sertifikat tidak ditemukan.');
+    const u=state.users.find(x=>x.id===cert.userId);
+    const enr=state.enrollments.find(e=>e.id===cert.enrollmentId);
+    const prog=state.programs.find(p=>p.id===cert.programId);
+    const c=certificateData();
     toast('Menyiapkan PDF sertifikat…');
-    const url=await B.fileURL(c.imagePath);
-    const response=await fetch(url);
-    const source=await blobData(await response.blob());
-    await pdfDownload(source,`${c.serial}_${c.title}`);
+    updateCertificate(enr||{userId:cert.userId,programId:cert.programId,programTitle:cert.title,predicate:cert.predicate,score:cert.score}, cert.serial);
+    const canvas=await captureCertificate();
+    await pdfDownload(canvas.toDataURL('image/jpeg',.92),`Sertifikat_${cert.serial}_${(u?.name||'Peserta')}`);
+    updateCertificate();
     return;
   }
   if(action==='print-issued-selected'){
     adminOnly();
     const ids=[...document.querySelectorAll('.issued-pick:checked')].map(cb=>cb.value);
-    if(!ids.length)throw new Error('Centang minimal 1 sertifikat terbit.');
-    toast(`Menggabungkan ${ids.length} sertifikat menjadi PDF…`);
+    if(!ids.length)throw new Error('Centang minimal satu sertifikat yang sudah terbit.');
+    toast(`Menyiapkan ${ids.length} halaman sertifikat dalam 1 file PDF…`);
     const {jsPDF}=await import('../vendor/pdf.js');
     const pdf=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
     for(let i=0;i<ids.length;i++){
-      const c=state.certificates.find(x=>x.id===ids[i]);
-      if(!c)continue;
-      const url=await B.fileURL(c.imagePath);
-      const response=await fetch(url);
-      const source=await blobData(await response.blob());
-      if(i>0)pdf.addPage();
-      pdf.addImage(source,'JPEG',0,0,297,210);
+      const cert=state.certificates.find(x=>x.id===ids[i]);
+      if(!cert)continue;
+      const enr=state.enrollments.find(e=>e.id===cert.enrollmentId)||{userId:cert.userId,programId:cert.programId,programTitle:cert.title,predicate:cert.predicate,score:cert.score};
+      updateCertificate(enr, cert.serial);
+      const canvas=await captureCertificate();
+      if(i>0)pdf.addPage('a4','landscape');
+      pdf.addImage(canvas.toDataURL('image/jpeg',.92),'JPEG',0,0,297,210);
     }
-    pdf.save(`Cetak_Sertifikat_Terpilih_${ids.length}.pdf`);
+    pdf.save(`Sertifikat_Terpilih_${new Date().toISOString().slice(0,10)}.pdf`);
+    updateCertificate();
     return;
-  }
-  if(action==='preview-pdf'){adminOnly();toast('Menyiapkan PDF…');const canvas=await captureCertificate();return pdfDownload(canvas.toDataURL('image/jpeg',.96),'Sertifikat_Preview');}
-  if(action==='approve-user'||action==='reject-user'){adminOnly();await B.patch('users',el.dataset.id,{status:action==='approve-user'?'approved':'rejected',...(action==='reject-user'?{chatAccess:false}:{}),updatedAt:B.stamp()});return toast('Status akun diperbarui.');}
-  if(['archive-program','archive-news','delete-module'].includes(action)){adminOnly();return modal('Konfirmasi',`<p>Lanjutkan tindakan ini?</p><button class="button danger" data-action="confirm-change" data-kind="${action}" data-id="${esc(el.dataset.id)}">Ya, Lanjutkan</button>`);}
-  if(action==='confirm-change'){adminOnly();const kind=el.dataset.kind;if(kind==='delete-module')await B.remove('ebooks',el.dataset.id);else await B.patch(kind==='archive-program'?'programs':'news',el.dataset.id,{published:false,updatedAt:B.stamp()});close();if(tab==='cms')renderCMS();if(tab==='modules-admin')setTimeout(renderModuleAdmin,200);if(tab==='pmk-admin')setTimeout(()=>renderPMKAdmin(true),200);if(tab==='ukom-admin')setTimeout(()=>renderUKOMAdmin(true),200);return toast('Perubahan tersimpan.');}
-  if(action==='edit-program'){
-    adminOnly();
-    const p=state.programs.find(p=>p.id===el.dataset.id);
-    const fee=HauraFinance.programFee(p), minDp=HauraFinance.programMinDp(p);
-    return modal('Edit Program',`<form data-form="edit-program" data-id="${esc(p.id)}">
-      ${field('Nama Program','title','text',p.title,'required maxlength="180"')}
-      ${area('Deskripsi','description',p.description,'required maxlength="3000"')}
-      ${field('Total Biaya Pelatihan (Rp)','totalFee','number',String(fee||500000),'required min="1000" step="1000"')}
-      ${field('Minimal Bayar Pendaftaran / DP (Rp)','minDownPayment','number',String(minDp||150000),'required min="0" step="1000"')}
-      ${submit('Simpan Perubahan')}
-    </form>`);
   }
 }
 
-async function doSubmit(form){
-  const type=form.dataset.form,d=new FormData(form);
+async function submitForm(form,data){
+  const kind=form.dataset.form;
 
-  if(type==='offline-login'){
-    const acc = await OfflineAuth.verifyLogin(d.get('email'), d.get('offlinePassword')||'');
-    close();
+  if(kind==='offline-login'){
+    const acc = await OfflineAuth.verifyLogin(data.get('email'), data.get('offlinePassword')||'');
     await enterOfflineSession(acc);
-    return toast('Berhasil masuk mode offline. Selamat membaca buku digital.');
-  }
-
-  ready();
-
-  if(type==='verify-receipt-form'){
-    const no = String(d.get('receiptNumber')||'').trim();
-    const res = await B.verifyReceipt(no);
-    if(!res?.valid || !res.receipt) throw new Error('Nomor seri kuitansi tidak ditemukan.');
-    return showReceiptVerificationResult(res.receipt);
-  }
-
-  if(type==='submit-charity'){
-    const file = d.get('proof');
-    const path = `public/charity/${uid()}`;
-    toast('Mengunggah bukti amal…');
-    await B.upload(path, file);
-    await B.donate({
-      donorName: String(d.get('donorName')||'Hamba Allah').trim(),
-      amount: Number(d.get('amount')||0),
-      note: String(d.get('note')||'').trim(),
-      proofPath: path
-    });
     close();
-    return toast('Terima kasih! Bukti amal telah dikirim untuk verifikasi.');
+    return toast('Masuk ke mode offline berhasil.');
   }
-
-  if(type==='subscribe-access'){
-    if(!me) throw new Error('Silakan masuk.');
-    const file = d.get('proof');
-    const path = `proofs/${me.uid}/${uid()}`;
-    toast('Mengunggah bukti pembayaran paket akses…');
-    await B.upload(path, file);
-    await B.subscribeAccess({proofPath: path});
-    return toast('Bukti pembayaran paket akses terkirim. Menunggu konfirmasi admin.');
-  }
-
-  if(type==='set-offline-password'){
-    if(!me) throw new Error('Silakan masuk.');
-    const p1 = String(d.get('newOfflinePass')||'');
-    const p2 = String(d.get('confirmOfflinePass')||'');
-    if(p1.length < 4) throw new Error('Password minimal 4 karakter.');
-    if(p1 !== p2) throw new Error('Konfirmasi password tidak cocok.');
-    OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin, gate: state.cms.subscriptionGate});
+  if(kind==='set-offline-password'){
+    member();
+    const p1 = String(data.get('newOfflinePass')||'');
+    const p2 = String(data.get('confirmOfflinePass')||'');
+    if(p1.length < 4) throw new Error('Password offline minimal 4 karakter.');
+    if(p1 !== p2) throw new Error('Konfirmasi password offline tidak cocok.');
     await OfflineAuth.setOfflinePassword(me.uid, p1);
     close();
-    return toast('Password Login Offline berhasil disimpan.');
+    return toast('Password login offline berhasil disimpan.');
   }
 
-  if(type==='save-biodata'){
-    if(!me)throw new Error('Silakan masuk.');
+  if(kind==='save-biodata'){
+    member();
     const targetUid=form.dataset.uid||me.uid;
-    if(!admin && targetUid!==me.uid)throw new Error('Tidak diizinkan.');
-    const targetUser=targetUid===me.uid?profile:state.users.find(x=>x.id===targetUid);
-    let photoPath=targetUser?.photoPath||'';
-    const photoFile=d.get('photo');
+    if(!admin && targetUid!==me.uid)throw new Error('Tidak memiliki izin.');
+    const existing=admin ? (state.users.find(u=>u.id===targetUid)||{}) : (profile||{});
+    let photoPath=existing.photoPath||'';
+    const photoFile=data.get('photo');
     if(photoFile && photoFile.size>0){
-      photoPath=`profiles/${targetUid}/${uid()}`;
-      toast('Mengunggah pas foto…');
-      await B.upload(photoPath,photoFile);
+      const up=await B.uploadFile(`avatars/${targetUid}/${uid()}`,photoFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      if(photoPath)await B.removeFile(photoPath).catch(()=>{});
+      photoPath=up.path;
     }
-    const patchData={
+    const payload={
+      name:String(data.get('name')||'').trim(),
+      fullTitleName:String(data.get('fullTitleName')||'').trim(),
+      nik:String(data.get('nik')||'').trim(),
+      strNumber:String(data.get('strNumber')||'').trim(),
+      niraNumber:String(data.get('niraNumber')||'').trim(),
+      birthPlace:String(data.get('birthPlace')||'').trim(),
+      birthDate:String(data.get('birthDate')||'').trim(),
+      gender:String(data.get('gender')||'').trim(),
+      phone:String(data.get('phone')||'').trim(),
+      institution:String(data.get('institution')||'').trim(),
+      education:String(data.get('education')||'').trim(),
+      address:String(data.get('address')||'').trim(),
       photoPath,
-      name:String(d.get('name')||'').trim(),
-      fullTitleName:String(d.get('fullTitleName')||'').trim(),
-      nik:String(d.get('nik')||'').trim(),
-      strNumber:String(d.get('strNumber')||'').trim(),
-      niraNumber:String(d.get('niraNumber')||'').trim(),
-      birthPlace:String(d.get('birthPlace')||'').trim(),
-      birthDate:String(d.get('birthDate')||'').trim(),
-      gender:String(d.get('gender')||'').trim(),
-      phone:String(d.get('phone')||'').trim(),
-      institution:String(d.get('institution')||'').trim(),
-      education:String(d.get('education')||'').trim(),
-      address:String(d.get('address')||'').trim(),
       updatedAt:B.stamp()
     };
-    if(admin && d.has('batch'))patchData.batch=String(d.get('batch')||'').trim();
-    await B.patch('users',targetUid,patchData);
+    if(admin && data.get('batch')!==null){
+      payload.batch=String(data.get('batch')||'').trim();
+    }
+    await B.patch('users',targetUid,payload);
     if(targetUid===me.uid && profile){
-      Object.assign(profile,patchData);
+      profile={...profile,...payload};
       OfflineAuth.saveSession({uid:me.uid, email:me.email, profile, admin, gate: state.cms.subscriptionGate});
-      navRender();
-      if(!$('#portal-view').hidden)dashboard();
     }
     close();
+    dashboard();
     return toast('Biodata lengkap berhasil disimpan.');
   }
 
-  member();
-
-  if(type==='paid-enroll'){
-    const file=d.get('proof');
-    const path=`proofs/${me.uid}/${uid()}`;
-    toast('Mengunggah bukti…');
-    await B.upload(path,file);
-    await B.paidEnroll({programId:form.dataset.id,amount:Number(d.get('amount')),proofPath:path});
-    close();
-    dashboard();
-    return toast('Pendaftaran berhasil dikirim.');
-  }
-
-  if(type==='submit-installment'){
-    const file=d.get('proof');
-    const path=`proofs/${me.uid}/${uid()}`;
-    toast('Mengunggah bukti…');
-    await B.upload(path,file);
-    await B.submitPayment({enrollmentId:form.dataset.id,amount:Number(d.get('amount')),proofPath:path});
-    close();
-    return toast('Bukti pelunasan terkirim.');
-  }
-
-  if(type==='subscribe-chat'){
-    const file=d.get('proof');
-    const path=`proofs/${me.uid}/${uid()}`;
-    toast('Mengunggah bukti langganan…');
-    await B.upload(path,file);
-    await B.subscribeChat({proofPath:path});
-    return toast('Bukti langganan diskusi terkirim.');
-  }
-
-  if(type==='order-alkes'){
-    const alkesList=state.alkes.filter(a=>!a.kind||a.kind==='alkes');
-    const items=[];
-    for(const item of alkesList){
-      const qty=Number(alkesCart[item.id]||0);
-      if(qty>0)items.push({alkesId:item.id,qty});
+  if(kind==='assign-batch'){
+    adminOnly();
+    const batchName=String(data.get('batchName')||'').trim();
+    const picked=[...document.querySelectorAll('.user-batch-pick:checked')].map(cb=>cb.value);
+    if(!picked.length)throw new Error('Centang minimal satu peserta.');
+    for(const uidTarget of picked){
+      await B.patch('users',uidTarget,{batch:batchName,updatedAt:B.stamp()});
     }
-    if(!items.length)throw new Error('Pilih minimal 1 alkes.');
-    const file=d.get('proof');
-    const path=`proofs/${me.uid}/${uid()}`;
-    toast('Mengunggah bukti pesanan…');
-    await B.upload(path,file);
-    await B.orderAlkes({items,shippingNote:d.get('shippingNote'),proofPath:path});
-    alkesCart={};
-    return toast('Pesanan alkes berhasil dikirim.');
+    return toast(`Angkatan "${batchName}" diterapkan ke ${picked.length} peserta.`);
   }
 
-  if(type==='order-physical-book'){
-    const alkesId=form.dataset.alkes;
-    const qty=Math.max(1,Number(d.get('qty')||1));
-    const file=d.get('proof');
-    const path=`proofs/${me.uid}/${uid()}`;
-    toast('Mengunggah bukti pesanan buku fisik…');
-    await B.upload(path,file);
-    await B.orderAlkes({items:[{alkesId,qty}],shippingNote:`[BUKU FISIK] ${String(d.get('shippingNote')||'').trim()}`,proofPath:path});
-    close();
-    return toast('Pesanan buku fisik berhasil dikirim.');
-  }
-
-  if(type==='order-baju'){
-    const bajuList=state.alkes.filter(a=>a.kind==='baju');
-    const items=[];
-    for(const item of bajuList){
-      const qty=Number(bajuCart[item.id]||0);
-      if(qty>0)items.push({alkesId:item.id,qty});
+  if(kind==='admin-set-access'){
+    adminOnly();
+    const uidTarget=form.dataset.uid;
+    const days=Number(data.get('durationDays')||0);
+    if(days<=0){
+      await B.patch('users',uidTarget,{accessStatus:'inactive',accessExpiresAtMs:0,updatedAt:B.stamp()});
+    }else{
+      const baseMs=Math.max(getTrustedTimeMs(), Number(state.users.find(u=>u.id===uidTarget)?.accessExpiresAtMs||0));
+      const expMs=baseMs + days*86400000;
+      await B.patch('users',uidTarget,{accessStatus:'active',accessExpiresAtMs:expMs,updatedAt:B.stamp()});
     }
-    if(!items.length)throw new Error('Pilih minimal 1 baju.');
-    const file=d.get('proof');
-    const path=`proofs/${me.uid}/${uid()}`;
-    toast('Mengunggah bukti pesanan PO baju…');
-    await B.upload(path,file);
-    const detail=`[PO BAJU] Ukuran/Warna: ${String(d.get('sizeDetail')||'').trim()} | Bordir: ${String(d.get('embroideryName')||'-').trim()} | Kirim: ${String(d.get('shippingNote')||'').trim()}`;
-    await B.orderAlkes({items,shippingNote:detail,proofPath:path});
-    bajuCart={};
-    return toast('Pesanan PO Baju Kesehatan berhasil dikirim.');
-  }
-
-  if(type==='save-ukom-progress'){
-    const enr=state.enrollments.find(e=>e.id===form.dataset.id);
-    if(!enr)throw new Error('Data bimbingan UKOM tidak ditemukan.');
-    const ukomChecklist={};
-    for(const s of UKOM_STEPS){
-      ukomChecklist[s.key]={
-        done:d.get('done_'+s.key)==='on',
-        note:String(d.get('note_'+s.key)||'').trim()
-      };
-    }
-    await B.patch('enrollments',enr.id,{ukomChecklist,updatedAt:B.stamp()});
-    close();
-    return toast('Progres belajar UKOM tersimpan.');
-  }
-
-  if(type==='save-pmk-docs'){
-    const enr=state.enrollments.find(e=>e.id===form.dataset.id);
-    if(!enr)throw new Error('Data bimbingan tidak ditemukan.');
-    const pmkChecklist={};
-    for(const s of PMK_STEPS){
-      pmkChecklist[s.key]={
-        done:d.get('done_'+s.key)==='on',
-        note:String(d.get('note_'+s.key)||'').trim()
-      };
-    }
-    let pmkDocPath=enr.pmkDocPath||'';
-    const docFile=d.get('pmkFile');
-    if(docFile && docFile.size>0){
-      pmkDocPath=`proofs/${me.uid}/${uid()}`;
-      toast('Mengunggah berkas PMK…');
-      await B.upload(pmkDocPath,docFile);
-    }
-    await B.patch('enrollments',enr.id,{pmkChecklist,pmkDocPath,updatedAt:B.stamp()});
-    close();
-    return toast('Progres berkas PMK tersimpan.');
-  }
-
-  if(type==='chat'||type==='sbar'){
-    if(!hasEffectiveChatAccess())throw new Error('Akses diskusi belum aktif.');
-    const data={senderId:me.uid,senderRole:admin?'admin':'peserta',kind:type==='sbar'?'sbar':'text',text:type==='chat'?String(d.get('text')).trim():'',createdAt:B.stamp()};
-    if(type==='chat'&&!data.text)return;
-    if(type==='sbar')data.sbar=Object.fromEntries(['s','b','a','r'].map(k=>[k,String(d.get(k)).trim()]));
-    await B.add(`conversations/${targetChat}/messages`,data);
-    form.reset();
-    if(type==='sbar'){close();toast('Laporan SBAR terkirim.');}
-    return;
-  }
-
-  adminOnly();
-
-  if(type==='record-cash-payment'){
-    const res = await B.recordCashPayment({
-      enrollmentId: form.dataset.enr,
-      amount: Number(d.get('amount')||0),
-      note: String(d.get('note')||'').trim()
-    });
-    close();
-    toast(`Pembayaran tunai dicatat. Kuitansi ${res?.receiptNumber||''} terbit.`);
-    return;
-  }
-
-  if(type==='direct-cash-enroll'){
-    const res = await B.recordCashPayment({
-      userId: String(d.get('userId')||'').trim(),
-      programId: String(d.get('programId')||'').trim(),
-      amount: Number(d.get('amount')||0),
-      note: String(d.get('note')||'').trim()
-    });
-    close();
-    toast(`Pendaftaran & bayar tunai berhasil. Kuitansi ${res?.receiptNumber||''} terbit.`);
-    return;
-  }
-
-  if(type==='subscription-gate-config'){
-    const subscriptionGate = {
-      enabled: d.get('enabled') === 'on',
-      packageName: String(d.get('packageName')||'Akses Portal & Modul 1 Tahun').trim(),
-      price: Number(d.get('price')||50000),
-      durationDays: Number(d.get('durationDays')||365)
-    };
-    await B.patch('settings','public',{subscriptionGate,updatedAt:B.stamp()});
-    state.cms.subscriptionGate = subscriptionGate;
-    return toast('Pengaturan paket akses portal tersimpan.');
-  }
-
-  if(type==='admin-set-access'){
-    await B.setUserAccess({
-      userId: form.dataset.uid,
-      durationDays: Number(d.get('durationDays')||0)
-    });
     close();
     return toast('Masa aktif paket akses peserta diperbarui.');
   }
 
-  if(type==='add-banner'){
-    const file = d.get('bannerFile');
-    if(!file || !file.size) throw new Error('Pilih file gambar banner.');
-    const path = `public/banners/${uid()}`;
-    toast('Mengunggah foto banner…');
-    await B.upload(path, file);
-    const nextBanners = [...(state.cms.banners||[]), {
-      id: uid(),
-      imagePath: path,
-      title: String(d.get('title')||'').trim(),
-      caption: String(d.get('caption')||'').trim(),
-      createdAt: new Date().toISOString()
-    }];
-    await B.patch('settings','public',{banners:nextBanners,updatedAt:B.stamp()});
-    state.cms.banners = nextBanners;
-    renderTopBannerSlider();
-    renderCMS();
-    return toast('Foto berhasil ditambahkan ke galeri banner atas.');
-  }
-
-  if(type==='charity-config'){
-    const charity = {
-      ...(state.cms.charity||{}),
-      enabled: d.get('enabled') === 'on',
-      title: String(d.get('title')||'Celengan Amal Haura Institute').trim(),
-      description: String(d.get('description')||'').trim()
+  if(kind==='subscription-gate-config'){
+    adminOnly();
+    const gate={
+      enabled:Boolean(data.get('enabled')),
+      packageName:String(data.get('packageName')||'Akses Portal & Modul').trim(),
+      price:Number(data.get('price')||0),
+      durationDays:Number(data.get('durationDays')||365)
     };
-    await B.patch('settings','public',{charity,updatedAt:B.stamp()});
-    state.cms.charity = charity;
-    renderPublicCharity();
-    return toast('Pengaturan Celengan Amal tersimpan.');
+    await B.saveCMS({...state.cms,subscriptionGate:gate});
+    return toast('Pengaturan paket akses portal disimpan.');
   }
 
-  if(type==='distribute-charity'){
-    await B.reviewDonation({
-      decision: 'distribute',
-      amount: Number(d.get('amount')||0),
-      distributionTarget: String(d.get('distributionTarget')||'').trim()
+  if(kind==='subscribe-access'){
+    ready();
+    if(!me||!profile)throw new Error('Silakan masuk terlebih dahulu.');
+    const gate=state.cms.subscriptionGate||{enabled:true,price:50000,durationDays:365,packageName:'Akses Portal & Modul'};
+    const up=await B.uploadFile(`accessPayments/${me.uid}/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.add('accessPayments',{
+      userId:me.uid,
+      packageName:gate.packageName,
+      durationDays:Number(gate.durationDays||365),
+      amount:Number(gate.price||50000),
+      proofPath:up.path,
+      status:'pending',
+      createdAt:B.stamp()
     });
-    form.reset();
+    dashboard();
+    return toast('Bukti paket akses terkirim. Menunggu verifikasi admin.');
+  }
+
+  if(kind==='verify-receipt-form'){
+    ready();
+    const serial=String(data.get('receiptNumber')||'').trim();
+    if(!serial)throw new Error('Masukkan nomor seri kuitansi.');
+    const res=await B.verifyReceipt(serial);
+    if(!res?.valid || !res.receipt)throw new Error('Nomor kuitansi tidak ditemukan atau belum sah.');
+    return showReceiptVerificationResult(res.receipt);
+  }
+
+  if(kind==='submit-charity'){
+    ready();
+    const donorName=String(data.get('donorName')||'Hamba Allah').trim()||'Hamba Allah';
+    const amount=Number(data.get('amount')||0);
+    const note=String(data.get('note')||'').trim();
+    if(amount<1000)throw new Error('Nominal minimal Rp 1.000.');
+    const up=await B.uploadFile(`donations/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.add('donations',{
+      userId:me?.uid||'guest',
+      donorName,
+      amount,
+      note,
+      proofPath:up.path,
+      status:'pending',
+      createdAt:B.stamp()
+    });
+    close();
+    return toast('Terima kasih! Konfirmasi amal Anda sedang diverifikasi.');
+  }
+
+  if(kind==='charity-config'){
+    adminOnly();
+    const ch={
+      ...(state.cms.charity||{}),
+      enabled:Boolean(data.get('enabled')),
+      title:String(data.get('title')||'Celengan Amal Haura Institute').trim(),
+      description:String(data.get('description')||'').trim()
+    };
+    await B.saveCMS({...state.cms,charity:ch});
+    renderPublicCharity();
+    return toast('Pengaturan Celengan Amal disimpan.');
+  }
+
+  if(kind==='distribute-charity'){
+    adminOnly();
+    const amount=Number(data.get('amount')||0);
+    const distributionTarget=String(data.get('distributionTarget')||'').trim();
+    if(amount<=0)throw new Error('Nominal penyaluran tidak valid.');
+    await B.add('donations',{
+      userId:me.uid,
+      donorName:'Penyaluran Dana Sosial',
+      amount,
+      distributionTarget,
+      note:distributionTarget,
+      status:'distributed',
+      createdAt:B.stamp(),
+      confirmedAt:B.stamp()
+    });
+    renderPublicCharity();
+    renderCMS();
     return toast('Penyaluran dana amal berhasil dicatat.');
   }
 
-  if(type==='assign-batch'){
-    const batchName=String(d.get('batchName')||'').trim();
-    const uids=[...document.querySelectorAll('.user-batch-pick:checked')].map(cb=>cb.value);
-    if(!uids.length)throw new Error('Centang minimal 1 peserta terlebih dahulu.');
-    for(const id of uids){
-      await B.patch('users',id,{batch:batchName,updatedAt:B.stamp()});
-    }
-    form.reset();
-    return toast(`Angkatan "${batchName}" diterapkan ke ${uids.length} peserta.`);
+  if(kind==='add-banner'){
+    adminOnly();
+    const file=data.get('bannerFile');
+    if(!file||!file.size)throw new Error('Pilih file foto banner terlebih dahulu.');
+    const up=await B.uploadFile(`banners/${uid()}`,file,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    const nextBanners=[...(state.cms.banners||[]),{
+      id:uid(),
+      imagePath:up.path,
+      title:String(data.get('title')||'').trim(),
+      caption:String(data.get('caption')||'').trim(),
+      createdAt:Date.now()
+    }];
+    await B.saveCMS({...state.cms,banners:nextBanners});
+    bannerIdx=nextBanners.length-1;
+    renderTopBannerSlider();
+    renderCMS();
+    return toast('Foto ditambahkan ke galeri banner atas.');
   }
 
-  if(type==='save-ukom-review'){
-    await B.patch('enrollments',form.dataset.id,{
-      ukomStage:String(d.get('ukomStage')||'').trim(),
-      evaluationNote:String(d.get('evaluationNote')||'').trim(),
-      updatedAt:B.stamp()
+  if(kind==='save-evaluation-exam'){
+    adminOnly();
+    const meta=readBuilderFormIntoState();
+    const title=String(meta.title||'').trim();
+    const programId=String(meta.programId||'').trim();
+    const targetBatch=String(meta.targetBatch||'ALL').trim()||'ALL';
+    const durationMinutes=Math.max(1,Math.min(300,Number(meta.durationMinutes||30)));
+    const description=String(meta.description||'').trim();
+    const active=Boolean(meta.active);
+    const prog=state.programs.find(p=>p.id===programId);
+    if(!title)throw new Error('Judul evaluasi wajib diisi.');
+    if(!programId)throw new Error('Pilih pelatihan terkait.');
+
+    const cleanQuestions=builderQuestions.map((q,idx)=>{
+      const qText=String(q.text||'').trim();
+      const opts=(q.options||[]).map(o=>String(o||'').trim()).filter(o=>o.length>0);
+      const ansIdx=Number(q.answerIndex||0);
+      if(!qText)throw new Error(`Pertanyaan soal nomor ${idx+1} masih kosong.`);
+      if(opts.length<2)throw new Error(`Soal nomor ${idx+1} minimal harus memiliki 2 pilihan jawaban.`);
+      if(ansIdx<0||ansIdx>=opts.length)throw new Error(`Kunci jawaban soal nomor ${idx+1} tidak valid.`);
+      return {
+        id:q.id||('q_'+idx+'_'+uid().slice(0,5)),
+        text:qText,
+        options:opts,
+        answerIndex:ansIdx,
+        explanation:String(q.explanation||'').trim()
+      };
     });
-    close();
-    return toast('Progres Bimbingan UKOM diperbarui.');
-  }
+    if(!cleanQuestions.length)throw new Error('Minimal harus ada 1 soal.');
 
-  if(type==='save-pmk-review'){
-    await B.patch('enrollments',form.dataset.id,{
-      pmkStage:String(d.get('pmkStage')||'').trim(),
-      evaluationNote:String(d.get('evaluationNote')||'').trim(),
+    const payload={
+      title,
+      programId,
+      programTitle:prog?.title||'',
+      targetBatch,
+      durationMinutes,
+      description,
+      active,
+      questions:cleanQuestions,
       updatedAt:B.stamp()
-    });
-    close();
-    return toast('Progres bimbingan PMK diperbarui.');
+    };
+
+    if(meta.editId){
+      await B.patch('evaluations',meta.editId,payload);
+      const idx=state.evaluations.findIndex(x=>x.id===meta.editId);
+      if(idx>=0)state.evaluations[idx]={...state.evaluations[idx],...payload};
+      builderQuestions=[defaultQuestionItem(1)];
+      renderEvaluationsAdmin(null);
+      return toast('Evaluasi digital berhasil diperbarui.');
+    }else{
+      const docRef=await B.add('evaluations',{...payload,createdAt:B.stamp()});
+      state.evaluations=[{id:docRef.id,...payload},...state.evaluations];
+      builderQuestions=[defaultQuestionItem(1)];
+      renderEvaluationsAdmin(null);
+      return toast('Evaluasi digital baru berhasil disimpan.');
+    }
   }
 
-  if(type==='finance-config'){
-    let qrisPath=state.cms.qrisPath||'';
-    const qrisFile=d.get('qris');
-    if(qrisFile && qrisFile.size>0){
-      qrisPath=`public/qris/${uid()}`;
-      toast('Mengunggah QRIS…');
-      await B.upload(qrisPath,qrisFile);
+  if(kind==='submit-evaluation-exam'){
+    member();
+    const evalId=form.dataset.evalId;
+    const ev=(state.evaluations||[]).find(x=>x.id===evalId);
+    if(!ev)throw new Error('Evaluasi tidak ditemukan.');
+    const answers={};
+    for(const q of (ev.questions||[])){
+      const val=data.get('q_'+q.id);
+      if(val!==null && val!==undefined && val!==''){
+        answers[q.id]=Number(val);
+      }
     }
-    await B.patch('settings','public',{
-      qrisPath,
-      paymentInfo:String(d.get('paymentInfo')||'').trim(),
-      chatFee:Number(d.get('chatFee')||0),
-      chatDurationLabel:String(d.get('chatDurationLabel')||'30 Hari').trim(),
-      updatedAt:B.stamp()
-    });
-    return toast('Pengaturan keuangan tersimpan.');
+    const btn=$('#eval-submit-btn');
+    if(btn){btn.disabled=true;btn.textContent='Mengirim & Menghitung Nilai…';}
+    try{
+      const res=await B.submitEvaluation({evaluationId:evalId,answers});
+      stopEvalCountdown();
+      activeEvalSession=null;
+      const sub=res?.submission;
+      if(sub){
+        const idx=state.evaluationSubmissions.findIndex(s=>s.id===sub.id);
+        if(idx>=0)state.evaluationSubmissions[idx]=sub;
+        else state.evaluationSubmissions=[sub,...state.evaluationSubmissions];
+      }
+      renderMemberEvaluations(true);
+      if(sub)openSubmissionRecapModal(sub);
+      toast(`Evaluasi selesai! Nilai Anda: ${res?.score??0}/100 (${res?.predicate||''})`);
+    }catch(err){
+      if(btn){btn.disabled=false;btn.textContent='Kumpulkan & Hitung Nilai Otomatis';}
+      throw err;
+    }
+    return;
   }
 
-  if(type==='add-alkes'){
-    let imagePath='';
-    const imgFile=d.get('alkesImg');
-    if(imgFile && imgFile.size>0){
-      imagePath=`public/alkes/${uid()}`;
-      await B.upload(imagePath,imgFile);
-    }
-    await B.add('alkes',{
-      kind:'alkes',
-      name:String(d.get('name')).trim(),
-      unit:String(d.get('unit')).trim(),
-      price:Number(d.get('price')),
-      description:String(d.get('description')||'').trim(),
-      imagePath,
-      published:true,
+  if(kind==='order-physical-book'){
+    member();
+    const alkesId=form.dataset.alkes;
+    const item=state.alkes.find(a=>a.id===alkesId);
+    if(!item)throw new Error('Produk buku fisik tidak ditemukan.');
+    const qty=Math.max(1,Number(data.get('qty')||1));
+    const shippingNote=String(data.get('shippingNote')||'').trim();
+    const subtotal=Number(item.price)*qty;
+    const up=await B.uploadFile(`alkesOrders/${me.uid}/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.add('alkesOrders',{
+      userId:me.uid,
+      items:[{alkesId:item.id,name:item.name,unit:item.unit||'Eks',price:Number(item.price),qty,subtotal}],
+      totalAmount:subtotal,
+      shippingNote,
+      proofPath:up.path,
+      status:'pending',
       createdAt:B.stamp()
     });
-    form.reset();
-    return toast('Produk alkes ditambahkan.');
+    close();
+    return toast('Pesanan buku fisik terkirim. Menunggu verifikasi admin.');
   }
 
-  if(type==='add-baju'){
-    let imagePath='';
-    const imgFile=d.get('bajuImg');
-    if(imgFile && imgFile.size>0){
-      imagePath=`public/alkes/${uid()}`;
-      await B.upload(imagePath,imgFile);
+  if(kind==='save-ukom-progress'){
+    member();
+    const enr=state.enrollments.find(e=>e.id===form.dataset.id);
+    if(!enr)throw new Error('Data tidak ditemukan.');
+    const ukomChecklist={};
+    for(const step of UKOM_STEPS){
+      ukomChecklist[step.key]={
+        done:Boolean(data.get('done_'+step.key)),
+        note:String(data.get('note_'+step.key)||'').trim()
+      };
     }
-    const rawName=String(d.get('name')).trim();
+    await B.patch('enrollments',enr.id,{ukomChecklist,updatedAt:B.stamp()});
+    close();
+    return toast('Progres belajar UKOM disimpan.');
+  }
+
+  if(kind==='save-ukom-review'){
+    adminOnly();
+    const enr=state.enrollments.find(e=>e.id===form.dataset.id);
+    if(!enr)throw new Error('Data tidak ditemukan.');
+    await B.patch('enrollments',enr.id,{
+      ukomStage:String(data.get('ukomStage')||'').trim(),
+      evaluationNote:String(data.get('evaluationNote')||'').trim(),
+      updatedAt:B.stamp()
+    });
+    close();
+    return toast('Progres bimbingan UKOM diperbarui.');
+  }
+
+  if(kind==='save-pmk-docs'){
+    member();
+    const enr=state.enrollments.find(e=>e.id===form.dataset.id);
+    if(!enr)throw new Error('Data tidak ditemukan.');
+    const pmkChecklist={};
+    for(const step of PMK_STEPS){
+      pmkChecklist[step.key]={
+        done:Boolean(data.get('done_'+step.key)),
+        note:String(data.get('note_'+step.key)||'').trim()
+      };
+    }
+    const patch={pmkChecklist,updatedAt:B.stamp()};
+    const docFile=data.get('pmkFile');
+    if(docFile && docFile.size>0){
+      const up=await B.uploadFile(`pmkDocs/${me.uid}/${uid()}`,docFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      patch.pmkDocPath=up.path;
+    }
+    await B.patch('enrollments',enr.id,patch);
+    close();
+    return toast('Checklist & berkas PMK berhasil disimpan.');
+  }
+
+  if(kind==='save-pmk-review'){
+    adminOnly();
+    const enr=state.enrollments.find(e=>e.id===form.dataset.id);
+    if(!enr)throw new Error('Data tidak ditemukan.');
+    await B.patch('enrollments',enr.id,{
+      pmkStage:String(data.get('pmkStage')||'').trim(),
+      evaluationNote:String(data.get('evaluationNote')||'').trim(),
+      updatedAt:B.stamp()
+    });
+    close();
+    return toast('Tahap & arahan bimbingan PMK diperbarui.');
+  }
+
+  if(kind==='add-baju'){
+    adminOnly();
+    let imagePath='';
+    const imgFile=data.get('bajuImg');
+    if(imgFile && imgFile.size>0){
+      const up=await B.uploadFile(`alkesCatalog/${uid()}`,imgFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      imagePath=up.path;
+    }
     await B.add('alkes',{
       kind:'baju',
-      name:`[PO Baju] ${rawName}`,
+      name:'[PO Baju] '+String(data.get('name')||'').trim(),
+      price:Number(data.get('price')||0),
+      sizes:String(data.get('sizes')||'S, M, L, XL, XXL').trim(),
+      estimate:String(data.get('estimate')||'10 - 14 Hari Kerja').trim(),
       unit:'Set',
-      price:Number(d.get('price')),
-      sizes:String(d.get('sizes')||'S, M, L, XL, XXL').trim(),
-      estimate:String(d.get('estimate')||'10 - 14 Hari Kerja').trim(),
-      description:String(d.get('description')||'').trim(),
+      description:String(data.get('description')||'').trim(),
       imagePath,
-      published:true,
+      archived:false,
       createdAt:B.stamp()
     });
-    form.reset();
+    renderBajuAdmin(true);
     return toast('Katalog PO Baju Kesehatan ditambahkan.');
   }
 
-  if(type==='add-expense'){
-    await B.addExpense({programId:d.get('programId'),category:d.get('category'),description:d.get('description'),amount:Number(d.get('amount')),date:d.get('date')});
-    form.reset();
-    return toast('Pengeluaran tercatat.');
+  if(kind==='order-baju'){
+    member();
+    const bajuList=state.alkes.filter(a=>a.kind==='baju');
+    const items=[];
+    let total=0;
+    for(const item of bajuList){
+      const q=Number(bajuCart[item.id]||0);
+      if(q>0){
+        const sub=Number(item.price)*q;
+        total+=sub;
+        items.push({alkesId:item.id,name:item.name,unit:item.unit||'Set',price:Number(item.price),qty:q,subtotal:sub});
+      }
+    }
+    if(!items.length || total<=0)throw new Error('Pilih minimal 1 baju.');
+    const sizeDetail=String(data.get('sizeDetail')||'').trim();
+    const embroideryName=String(data.get('embroideryName')||'').trim();
+    const shippingNote=`Ukuran/Warna: ${sizeDetail}${embroideryName?` · Bordir: ${embroideryName}`:''} · Kirim: ${String(data.get('shippingNote')||'').trim()}`;
+    const up=await B.uploadFile(`alkesOrders/${me.uid}/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.add('alkesOrders',{
+      userId:me.uid,
+      items,
+      totalAmount:total,
+      shippingNote,
+      proofPath:up.path,
+      status:'pending',
+      createdAt:B.stamp()
+    });
+    bajuCart={};
+    renderMemberBaju(true);
+    return toast('Pesanan PO Baju Kesehatan terkirim.');
   }
 
-  if(type==='save-grade'){
-    await B.saveEvaluation({enrollmentId:form.dataset.id,score:d.get('score'),evaluationNote:d.get('evaluationNote')});
+  if(kind==='save-cert-config'){
+    adminOnly();
+    const prevCfg=state.cms?.certConfig||{};
+    let signaturePath=prevCfg.signaturePath||'';
+    let stampPath=prevCfg.stampPath||'';
+    const sigFile=data.get('signatureFile');
+    if(sigFile && sigFile.size>0){
+      const up=await B.uploadFile(`certAssets/sign_${uid()}`,sigFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      if(signaturePath)await B.removeFile(signaturePath).catch(()=>{});
+      signaturePath=up.path;
+      certImages.right=await B.fileURL(up.path).catch(()=>certImages.right);
+    }
+    const stampFile=data.get('stampFile');
+    if(stampFile && stampFile.size>0){
+      const up=await B.uploadFile(`certAssets/stamp_${uid()}`,stampFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      if(stampPath)await B.removeFile(stampPath).catch(()=>{});
+      stampPath=up.path;
+      certImages.stamp=await B.fileURL(up.path).catch(()=>certImages.stamp);
+    }
+    const nextCfg={
+      ...prevCfg,
+      signerName:String(data.get('signerName')||author).trim(),
+      signerTitle:String(data.get('signerTitle')||'Direktur Haura Institute').trim(),
+      signerIdNumber:String(data.get('signerIdNumber')||'').trim(),
+      city:String(data.get('city')||'Lombok Tengah').trim(),
+      bodyTemplate:String(data.get('bodyTemplate')||'').trim(),
+      signaturePath,
+      stampPath,
+      predicateRules:{
+        minA:Number(data.get('minA')??85),
+        labelA:String(data.get('labelA')||'Sangat Memuaskan').trim()||'Sangat Memuaskan',
+        minB:Number(data.get('minB')??75),
+        labelB:String(data.get('labelB')||'Memuaskan').trim()||'Memuaskan',
+        minC:Number(data.get('minC')??60),
+        labelC:String(data.get('labelC')||'Cukup').trim()||'Cukup',
+        labelD:String(data.get('labelD')||'Kurang').trim()||'Kurang'
+      }
+    };
+    await B.saveCMS({...state.cms,certConfig:nextCfg});
+    renderCertificateEditor();
+    return toast('Konfigurasi TTD, stempel & aturan predikat tersimpan.');
+  }
+
+  if(kind==='publish-cert-batch'){
+    adminOnly();
+    const pickedIds=[...document.querySelectorAll('.cert-pick:checked')].map(cb=>cb.value);
+    if(!pickedIds.length)throw new Error('Centang minimal satu peserta yang sudah lunas.');
+    const c=certificateData();
+    const {jsPDF}=await import('../vendor/pdf.js');
+    const pdf=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+    let pageIdx=0;
+    const startSerialMatch=String(c.serial||'').match(/^(.*?)(\d+)\s*$/);
+    const prefix=startSerialMatch?startSerialMatch[1]:'HI/2026/';
+    const startNum=startSerialMatch?Number(startSerialMatch[2]):1;
+    const padLen=startSerialMatch?startSerialMatch[2].length:4;
+
+    toast(`Menerbitkan & mencetak ${pickedIds.length} sertifikat…`);
+    for(let i=0;i<pickedIds.length;i++){
+      const enr=state.enrollments.find(e=>e.id===pickedIds[i]);
+      if(!enr)continue;
+      const u=state.users.find(x=>x.id===enr.userId);
+      const prog=state.programs.find(p=>p.id===enr.programId);
+      const courseName=resolveCertificateCourseTitle(c, enr, prog);
+      const scInfo=resolveParticipantScoreAndPredicate(enr);
+      const autoPredicate=scInfo.predicate || computeAutoPredicate(scInfo.score) || 'Memuaskan';
+      const serial=i===0 && c.serial ? String(c.serial).trim() : `${prefix}${String(startNum+i).padStart(padLen,'0')}`;
+
+      updateCertificate(enr, serial);
+      const canvas=await captureCertificate();
+      const up=await B.uploadFile(`certificates/${enr.userId}/${uid()}`,await new Promise(r=>canvas.toBlob(r,'image/jpeg',.92)),{maxBytes:5*1024*1024,types:['image/jpeg']});
+      await B.add('certificates',{
+        userId:enr.userId,
+        enrollmentId:enr.id,
+        programId:enr.programId,
+        title:courseName,
+        serial,
+        score:scInfo.score,
+        predicate:autoPredicate,
+        imagePath:up.path,
+        createdAt:B.stamp()
+      });
+
+      const certIndex={...(state.cms.certIndex||{})};
+      certIndex[serial]={
+        serial,
+        name:u?.fullTitleName||u?.name||'Peserta',
+        institution:u?.institution||'',
+        course:courseName,
+        score:scInfo.score,
+        predicate:autoPredicate,
+        issuedDate:c.issued||new Date().toISOString().slice(0,10),
+        imagePath:up.path
+      };
+      state.cms.certIndex=certIndex;
+      await B.saveCMS({...state.cms,certIndex});
+
+      if(pageIdx>0)pdf.addPage('a4','landscape');
+      pdf.addImage(canvas.toDataURL('image/jpeg',.92),'JPEG',0,0,297,210);
+      pageIdx++;
+    }
+    if(pageIdx>0)pdf.save(`Sertifikat_${new Date().toISOString().slice(0,10)}.pdf`);
+    updateCertificate();
+    return toast(`${pageIdx} sertifikat berhasil diterbitkan & diunduh.`);
+  }
+
+  if(kind==='paid-enroll'){
+    member();
+    const programId=form.dataset.id;
+    const amount=Number(data.get('amount')||0);
+    const up=await B.uploadFile(`paymentProofs/${me.uid}/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.submitPaidEnrollment({programId,amount,proofPath:up.path,method:'transfer'});
+    close();
+    return toast('Pendaftaran & bukti pembayaran terkirim.');
+  }
+
+  if(kind==='submit-installment'){
+    member();
+    const enrollmentId=form.dataset.id;
+    const amount=Number(data.get('amount')||0);
+    const up=await B.uploadFile(`paymentProofs/${me.uid}/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.submitInstallment({enrollmentId,amount,proofPath:up.path,method:'transfer'});
+    close();
+    return toast('Bukti pelunasan terkirim.');
+  }
+
+  if(kind==='record-cash-payment'){
+    adminOnly();
+    const enrollmentId=form.dataset.enr;
+    const amount=Number(data.get('amount')||0);
+    const note=String(data.get('note')||'Pembayaran tunai diterima langsung').trim();
+    const res=await B.recordCashPayment({enrollmentId,amount,note});
+    close();
+    if(res?.receipt){
+      openReceiptWindow(res.receipt);
+    }
+    return toast(res?.receiptNumber?`Tunai tercatat! Kuitansi: ${res.receiptNumber}`:'Pembayaran tunai dicatat.');
+  }
+
+  if(kind==='direct-cash-enroll'){
+    adminOnly();
+    const userId=String(data.get('userId')||'').trim();
+    const programId=String(data.get('programId')||'').trim();
+    const amount=Number(data.get('amount')||0);
+    const note=String(data.get('note')||'Pendaftaran & bayar tunai langsung').trim();
+    const res=await B.directCashEnroll({userId,programId,amount,note});
+    close();
+    if(res?.receipt){
+      openReceiptWindow(res.receipt);
+    }
+    return toast(res?.receiptNumber?`Peserta terdaftar & kuitansi terbit: ${res.receiptNumber}`:'Peserta terdaftar.');
+  }
+
+  if(kind==='save-grade'){
+    adminOnly();
+    const rawScore=data.get('score');
+    const scoreVal=(rawScore===null||rawScore==='')?null:Number(rawScore);
+    const predVal=scoreVal!==null&&Number.isFinite(scoreVal)?computeAutoPredicate(scoreVal):'';
+    await B.patch('enrollments',form.dataset.id,{
+      score:scoreVal,
+      predicate:predVal,
+      evaluationNote:String(data.get('evaluationNote')||'').trim(),
+      updatedAt:B.stamp()
+    });
     close();
     return toast('Nilai evaluasi tersimpan.');
   }
 
-  if(type==='cms'){
+  if(kind==='finance-config'){
+    adminOnly();
+    let qrisPath=state.cms.qrisPath||'';
+    const qrisFile=data.get('qris');
+    if(qrisFile && qrisFile.size>0){
+      const up=await B.uploadFile(`qris/${uid()}`,qrisFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      if(qrisPath)await B.removeFile(qrisPath).catch(()=>{});
+      qrisPath=up.path;
+    }
+    await B.saveCMS({
+      ...state.cms,
+      qrisPath,
+      paymentInfo:String(data.get('paymentInfo')||'').trim(),
+      chatFee:Number(data.get('chatFee')||0),
+      chatDurationLabel:String(data.get('chatDurationLabel')||'30 Hari').trim()
+    });
+    renderFinanceAdmin(true);
+    return toast('Pengaturan keuangan disimpan.');
+  }
+
+  if(kind==='add-alkes'){
+    adminOnly();
+    let imagePath='';
+    const imgFile=data.get('alkesImg');
+    if(imgFile && imgFile.size>0){
+      const up=await B.uploadFile(`alkesCatalog/${uid()}`,imgFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      imagePath=up.path;
+    }
+    await B.add('alkes',{
+      kind:'alkes',
+      name:String(data.get('name')||'').trim(),
+      unit:String(data.get('unit')||'Set').trim(),
+      price:Number(data.get('price')||0),
+      description:String(data.get('description')||'').trim(),
+      imagePath,
+      archived:false,
+      createdAt:B.stamp()
+    });
+    renderFinanceAdmin(true);
+    return toast('Produk alkes ditambahkan.');
+  }
+
+  if(kind==='order-alkes'){
+    member();
+    const alkesList=state.alkes.filter(a=>!a.kind||a.kind==='alkes');
+    const items=[];
+    let total=0;
+    for(const item of alkesList){
+      const q=Number(alkesCart[item.id]||0);
+      if(q>0){
+        const sub=Number(item.price)*q;
+        total+=sub;
+        items.push({alkesId:item.id,name:item.name,unit:item.unit,price:Number(item.price),qty:q,subtotal:sub});
+      }
+    }
+    if(!items.length || total<=0)throw new Error('Pilih minimal 1 item alkes.');
+    const shippingNote=String(data.get('shippingNote')||'').trim();
+    const up=await B.uploadFile(`alkesOrders/${me.uid}/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.add('alkesOrders',{
+      userId:me.uid,
+      items,
+      totalAmount:total,
+      shippingNote,
+      proofPath:up.path,
+      status:'pending',
+      createdAt:B.stamp()
+    });
+    alkesCart={};
+    renderMemberChatAndAlkes(true);
+    return toast('Pesanan alkes terkirim.');
+  }
+
+  if(kind==='subscribe-chat'){
+    member();
+    const fee=Number(state.cms.chatFee||0);
+    if(fee<=0)throw new Error('Biaya diskusi belum diatur.');
+    const up=await B.uploadFile(`chatPayments/${me.uid}/${uid()}`,data.get('proof'),{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+    await B.add('chatPayments',{
+      userId:me.uid,
+      amount:fee,
+      durationLabel:state.cms.chatDurationLabel||'30 Hari',
+      proofPath:up.path,
+      status:'pending',
+      createdAt:B.stamp()
+    });
+    renderMemberChatAndAlkes(true);
+    return toast('Bukti langganan diskusi terkirim.');
+  }
+
+  if(kind==='add-expense'){
+    adminOnly();
+    await B.add('expenses',{
+      programId:String(data.get('programId')||'').trim(),
+      category:String(data.get('category')||'BMHP').trim(),
+      description:String(data.get('description')||'').trim(),
+      amount:Number(data.get('amount')||0),
+      date:String(data.get('date')||'').trim(),
+      createdAt:B.stamp()
+    });
+    return toast('Pengeluaran dicatat.');
+  }
+
+  if(kind==='cms'){
+    adminOnly();
     let logoPath=state.cms.logoPath||'';
-    const logoFile=d.get('logoFile');
+    const logoFile=data.get('logoFile');
     if(logoFile && logoFile.size>0){
-      logoPath=`public/logo/${uid()}`;
-      toast('Mengunggah logo…');
-      await B.upload(logoPath,logoFile);
+      const up=await B.uploadFile(`branding/logo_${uid()}`,logoFile,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      if(logoPath)await B.removeFile(logoPath).catch(()=>{});
+      logoPath=up.path;
     }
     let videoPath=state.cms.videoPath||'';
-    const videoFile=d.get('videoFile');
+    const videoFile=data.get('videoFile');
     if(videoFile && videoFile.size>0){
-      videoPath=`public/videos/${uid()}`;
-      toast('Mengunggah video…');
-      await B.upload(videoPath,videoFile,['video/mp4','video/webm'],10*1024*1024);
+      const up=await B.uploadFile(`hero/${uid()}`,videoFile,{maxBytes:10*1024*1024,types:['video/mp4','video/webm']});
+      if(videoPath)await B.removeFile(videoPath).catch(()=>{});
+      videoPath=up.path;
     }
-    const videoUrl=(videoFile && videoFile.size>0)?'':safeURL(d.get('videoUrl'));
-    if(videoUrl)videoPath='';
-
-    await B.patch('settings','public',{
-      logoText:d.get('logoText').trim(),
+    await B.saveCMS({
+      ...state.cms,
+      logoText:String(data.get('logoText')||'HAURA').trim(),
       logoPath,
-      welcomeTitle:d.get('welcomeTitle').trim(),
-      welcomeText:d.get('welcomeText').trim(),
-      videoPath,
-      videoUrl,
-      updatedAt:B.stamp()
+      welcomeTitle:String(data.get('welcomeTitle')||'').trim(),
+      welcomeText:String(data.get('welcomeText')||'').trim(),
+      videoUrl:String(data.get('videoUrl')||'').trim(),
+      videoPath
     });
-    toast('Pengaturan & video beranda tersimpan.');
-    return;
+    applyBrandLogos();
+    publicRender();
+    renderCMS();
+    return toast('Pengaturan beranda & video disimpan.');
   }
 
-  if(type==='program'||type==='program-pmk'||type==='program-ukom'||type==='edit-program'){
-    const totalFee=Number(d.get('totalFee')||0);
-    const minDownPayment=Number(d.get('minDownPayment')||0);
-    if(minDownPayment>totalFee)throw new Error('Minimal DP melebihi total biaya.');
-    const existing=type==='edit-program'?state.programs.find(x=>x.id===form.dataset.id):null;
-    const kind=type==='program-pmk'?'pmk':(type==='program-ukom'?'ukom':(existing?.kind||'training'));
-    const data={kind,title:d.get('title').trim(),description:d.get('description').trim(),totalFee,minDownPayment,price:totalFee,published:true,updatedAt:B.stamp()};
-    if(type==='program'||type==='program-pmk'||type==='program-ukom')await B.add('programs',{...data,createdAt:B.stamp()});
-    else await B.patch('programs',form.dataset.id,data);
-    if(type==='program'||type==='program-pmk'||type==='program-ukom')form.reset();else close();
-    toast('Program tersimpan.');
-    return;
+  if(kind==='program'||kind==='program-ukom'||kind==='program-pmk'){
+    adminOnly();
+    const progKind=kind==='program-ukom'?'ukom':(kind==='program-pmk'?'pmk':'training');
+    await B.add('programs',{
+      kind:progKind,
+      title:String(data.get('title')||'').trim(),
+      description:String(data.get('description')||'').trim(),
+      totalFee:Number(data.get('totalFee')||0),
+      minDownPayment:Number(data.get('minDownPayment')||0),
+      archived:false,
+      createdAt:B.stamp()
+    });
+    form.reset();
+    if(progKind==='ukom')renderUKOMAdmin(true);
+    else if(progKind==='pmk')renderPMKAdmin(true);
+    else renderCMS();
+    return toast('Program berhasil ditambahkan.');
   }
 
-  if(type==='news'){await B.add('news',{title:d.get('title').trim(),content:d.get('content').trim(),published:true,createdAt:B.stamp()});form.reset();toast('Berita dipublikasikan.');return;}
+  if(kind==='edit-program'){
+    adminOnly();
+    await B.patch('programs',form.dataset.id,{
+      title:String(data.get('title')||'').trim(),
+      description:String(data.get('description')||'').trim(),
+      totalFee:Number(data.get('totalFee')||0),
+      minDownPayment:Number(data.get('minDownPayment')||0)
+    });
+    close();
+    return toast('Program diperbarui.');
+  }
 
-  if(type==='module-html'){
-    const htmlFile=d.get('htmlFile');
-    let htmlStr=String(d.get('htmlCode')||'').trim();
-    if(htmlFile && htmlFile.size>0){
-      htmlStr=await htmlFile.text();
+  if(kind==='news'){
+    adminOnly();
+    await B.add('news',{title:String(data.get('title')||'').trim(),content:String(data.get('content')||'').trim(),archived:false,createdAt:B.stamp()});
+    form.reset();
+    return toast('Berita dipublikasikan.');
+  }
+
+  if(kind==='module-html'){
+    adminOnly();
+    const title=String(data.get('title')||'').trim();
+    const description=String(data.get('description')||'').trim();
+    const userId=String(data.get('userId')||'all').trim()||'all';
+    const physicalPrice=Math.max(0,Number(data.get('physicalPrice')||0));
+    const file=data.get('htmlFile');
+    let htmlStr='';
+    if(file && file.size>0){
+      if(file.size>5*1024*1024)throw new Error('Ukuran file HTML maksimal 5 MB.');
+      htmlStr=await file.text();
+    }else{
+      htmlStr=String(data.get('htmlCode')||'');
     }
-    if(!htmlStr)throw new Error('Upload file HTML atau tempel kode HTML buku digital.');
-    const title=String(d.get('title')).trim();
-    const description=String(d.get('description')||'').trim();
-    const physicalPrice=Number(d.get('physicalPrice')||0);
-    let physicalAlkesId='';
+    if(!htmlStr.trim())throw new Error('Upload file HTML atau tempelkan kode HTML buku digital.');
 
+    let physicalAlkesId='';
     if(physicalPrice>0){
-      const linked=await B.add('alkes',{
-        kind:'book',
-        name:`[Buku Fisik] ${title}`,
-        unit:'Eksemplar',
+      const alkesRef=await B.add('alkes',{
+        kind:'book_physical',
+        name:'[Buku Fisik] '+title,
+        unit:'Eks',
         price:physicalPrice,
-        description,
-        published:true,
+        description:description||'Edisi buku cetak resmi Haura Institute.',
+        archived:false,
         createdAt:B.stamp()
       });
-      physicalAlkesId=linked.id;
+      physicalAlkesId=alkesRef.id;
     }
 
-    const blob=new Blob([htmlStr],{type:'text/html'});
-    const htmlPath=`ebooks/${me.uid}/${uid()}`;
-    toast('Menyimpan buku digital…');
-    await B.upload(htmlPath,blob,['text/html'],5*1024*1024);
-    const created=await B.add('ebooks',{title,description,kind:'html',htmlPath,url:'',physicalPrice,physicalAlkesId,userId:d.get('userId'),createdAt:B.stamp()});
-    if(created?.id) await saveOfflineEbookHtml({id:created.id,htmlPath,title}, htmlStr);
+    const blob=new Blob([htmlStr],{type:'text/html;charset=utf-8'});
+    const up=await B.uploadFile(`ebooks/${userId}/${uid()}.html`,blob,{maxBytes:5*1024*1024,types:['text/html']});
+    await B.add('ebooks',{
+      title,description,userId,kind:'html',htmlPath:up.path,physicalPrice,physicalAlkesId,createdAt:B.stamp()
+    });
     form.reset();
-    toast('Buku digital dipublikasikan.');
-    setTimeout(renderModuleAdmin,200);
-    return;
+    renderModuleAdmin();
+    return toast('Buku digital berhasil dipublikasikan.');
   }
 
-  if(type==='publish-cert-batch'){
-    const pickedIds=[...document.querySelectorAll('.cert-pick:checked')].map(cb=>cb.value);
-    if(!pickedIds.length)throw new Error('Centang minimal 1 peserta lunas.');
-    const c=certificateData();
-    const baseSerial=(c.serial||nextAutoSerial(0)).trim();
-    const serialMatch=baseSerial.match(/^(.*?)(\d+)$/);
-    const prefix=serialMatch?serialMatch[1]:baseSerial+'-';
-    const startNum=serialMatch?Number(serialMatch[2]):1;
-    const padLen=serialMatch?serialMatch[2].length:4;
+  if(kind==='chat'){
+    member();
+    if(!admin && !hasEffectiveChatAccess())throw new Error('Akses diskusi belum aktif.');
+    const text=String(data.get('text')||'').trim();
+    if(!text)return;
+    const send=B.F.httpsCallable(B.functionsInstance(),'sendMessage');
+    await send({peerId:admin?targetChat:me.uid,text});
+    form.reset();
+  }
 
-    const {jsPDF}=await import('../vendor/pdf.js');
-    const pdf=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
-    const certIndex={...(state.cms.certIndex||{})};
-    const issuedFmt=c.issued?new Date(c.issued+'T12:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'}):'';
-
-    for(let i=0;i<pickedIds.length;i++){
-      const enr=state.enrollments.find(e=>e.id===pickedIds[i]);
-      if(!enr||!HauraFinance.isPaidFull(enr))continue;
-      const u=state.users.find(x=>x.id===enr.userId);
-      const prog=state.programs.find(x=>x.id===enr.programId);
-      const courseName=(c.course||'').trim()||(enr.programTitle||prog?.title||'Program Pelatihan');
-      const serial=pickedIds.length===1 && !serialMatch ? baseSerial : `${prefix}${String(startNum+i).padStart(padLen,'0')}`;
-
-      toast(`Memproses sertifikat ${i+1}/${pickedIds.length} (${serial})…`);
-      updateCertificate(enr,serial);
-      const canvas=await captureCertificate();
-      const dataUrl=canvas.toDataURL('image/jpeg',.94);
-      if(i>0)pdf.addPage();
-      pdf.addImage(dataUrl,'JPEG',0,0,297,210);
-
-      const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.94));
-      const id=uid();
-      const memberPath=`certificates/${enr.userId}/${id}`;
-      const publicPath=`public/certs/${id}`;
-      await B.upload(memberPath,blob,['image/jpeg'],10*1024*1024);
-      await B.upload(publicPath,blob,['image/jpeg'],10*1024*1024);
-
-      await B.create('certificates',id,{
-        userId:enr.userId,
-        programId:enr.programId,
-        enrollmentId:enr.id,
-        title:courseName,
-        serial,
-        imagePath:memberPath,
-        publicImagePath:publicPath,
-        createdAt:B.stamp(),
-        issuedBy:me.uid
-      });
-
-      certIndex[serial]={
-        serial,
-        name:u?.fullTitleName||u?.name||enr.userId,
-        institution:u?.institution||'-',
-        course:courseName,
-        predicate:c.predicate||'PARTICIPANT',
-        issuedDate:issuedFmt,
-        imagePath:publicPath
-      };
-    }
-
-    await B.patch('settings','public',{certIndex,updatedAt:B.stamp()});
-    state.cms.certIndex=certIndex;
-    pdf.save(`Sertifikat_Haura_${pickedIds.length}_Peserta.pdf`);
-    toast(`${pickedIds.length} sertifikat diterbitkan & diunduh sebagai PDF.`);
-    setTimeout(renderCertificateEditor,300);
-    return;
+  if(kind==='sbar'){
+    member();
+    const send=B.F.httpsCallable(B.functionsInstance(),'sendMessage');
+    await send({peerId:me.uid,kind:'sbar',sbar:Object.fromEntries(['s','b','a','r'].map(k=>[k,String(data.get(k)||'').trim()]))});
+    close();
+    toast('Laporan SBAR terkirim.');
   }
 }
 
+/* ============================================================================
+   EVENT LISTENERS & INISIALISASI APLIKASI
+   ============================================================================ */
 document.addEventListener('click',async event=>{
   markUserActivity();
   const el=event.target.closest('[data-action]');
   if(!el)return;
+  if(el.tagName==='A')return;
   event.preventDefault();
-  if(el.disabled)return;
-  el.disabled=true;
-  try{await doAction(el.dataset.action,el);}catch(e){fail(e);}finally{el.disabled=false;}
+  try{await doAction(el.dataset.action,el);}catch(e){fail(e);}
 });
 
 document.addEventListener('submit',async event=>{
   markUserActivity();
-  const form=event.target.closest('[data-form]');
+  const form=event.target.closest('form[data-form]');
   if(!form)return;
   event.preventDefault();
-  const btn=form.querySelector('[type="submit"]');
+  const data=new FormData(form);
+  const btn=form.querySelector('button[type="submit"]');
   if(btn)btn.disabled=true;
-  try{await doSubmit(form);}catch(e){fail(e);}finally{if(btn)btn.disabled=false;}
+  try{await submitForm(form,data);}catch(e){fail(e);}finally{if(btn)btn.disabled=false;}
 });
 
 document.addEventListener('change',async event=>{
   markUserActivity();
-  const t=event.target;
-  if(t.id==='finance-filter'){financeFilterProgram=t.value;renderFinanceAdmin(true);hydrate();return;}
-  if(t.id==='val-batch-filter'){valFilterBatch=t.value;renderValidation(true);return;}
-  if(t.id==='cert-filter-prog'){certFilterProg=t.value;renderCertificateEditor();return;}
-  if(t.id==='cert-filter-batch'){certFilterBatch=t.value;renderCertificateEditor();return;}
-  if(t.classList?.contains('cert-pick')){updateCertificate();return;}
-  const certKey=t.dataset?.certImage;
-  if(certKey && t.files?.[0]){
-    certImages[certKey]=await blobData(t.files[0]);
+  if(event.target.name==='q_ans' && event.target.closest('.eval-builder-q')){
+    const meta=readBuilderFormIntoState();
+    renderEvaluationsAdmin(meta);
+    return;
+  }
+  const radio=event.target.closest('input[type="radio"][data-qid]');
+  if(radio && activeEvalSession){
+    const qid=radio.dataset.qid;
+    activeEvalSession.answers[qid]=Number(radio.value);
+    radio.closest('.eval-options')?.querySelectorAll('.eval-option').forEach(lbl=>{
+      lbl.classList.toggle('selected',lbl.contains(radio));
+    });
+    const qs=activeEvalSession.evaluation?.questions||[];
+    const ansCount=qs.filter(q=>activeEvalSession.answers[q.id]!==undefined&&activeEvalSession.answers[q.id]!==null&&activeEvalSession.answers[q.id]!=='').length;
+    const cntEl=$('#eval-answered-count');
+    if(cntEl)cntEl.textContent=String(ansCount);
+    return;
+  }
+
+  if(event.target.id==='eval-filter-prog'){evalFilterProg=event.target.value;renderEvaluationsAdmin();return;}
+  if(event.target.id==='eval-filter-batch'){evalFilterBatch=event.target.value;renderEvaluationsAdmin();return;}
+  if(event.target.id==='finance-filter'){financeFilterProgram=event.target.value;renderFinanceAdmin(true);hydrate();return;}
+  if(event.target.id==='val-batch-filter'){valFilterBatch=event.target.value;renderValidation(true);return;}
+  if(event.target.id==='cert-filter-prog'){certFilterProg=event.target.value;renderCertificateEditor();return;}
+  if(event.target.id==='cert-filter-batch'){certFilterBatch=event.target.value;renderCertificateEditor();return;}
+
+  const certKey=event.target.dataset.certImage;
+  if(certKey){
+    const file=event.target.files?.[0];
+    if(!file)return;
+    try{
+      B.validateFile(file,{maxBytes:5*1024*1024,types:['image/jpeg','image/png','image/webp']});
+      certImages[certKey]=await blobData(file);
+      updateCertificate();
+    }catch(e){fail(e);}
+    return;
+  }
+  if(event.target.closest('#certificate-form') || event.target.classList.contains('cert-pick')){
     updateCertificate();
   }
 });
 
-document.addEventListener('input',event=>{
+document.addEventListener('input', event=>{
   markUserActivity();
-  if(event.target.closest('#certificate-form'))updateCertificate();
-});
-
-window.addEventListener('online',()=>{
-  toast('Koneksi internet kembali aktif.');
-  resetRenderHashes();
-  if(me?.offline){
-    const saved = OfflineAuth.getActiveAccount();
-    if(saved) enterOfflineSession(saved);
-  }else{
-    navRender();
-    schedulePublicRender();
-    scheduleRefreshSection();
+  if(event.target.closest('#certificate-form')){
+    updateCertificate();
   }
 });
 
-window.addEventListener('offline',()=>{
-  toast('Mode offline aktif. Hanya Buku Digital yang tersedia.');
+$('#modal').addEventListener('cancel',e=>{e.preventDefault();close();});
+$('#modal').addEventListener('click',e=>{if(e.target===$('#modal'))close();});
+
+window.addEventListener('online', async () => {
+  toast('Koneksi internet kembali aktif. Menyinkronkan data…');
   resetRenderHashes();
   navRender();
-  schedulePublicRender();
-  if(me) dashboard();
-});
-
-window.addEventListener('message',async event=>{
-  if(event.origin!==location.origin || !event.data?.hauraAccount)return;
-  const msg=event.data.hauraAccount;
-  try{
-    if(msg.type==='login'){
-      await B.F.signInWithEmailAndPassword(B.authInstance(),msg.email,msg.password);
-      close();
-      toast('Selamat datang kembali.');
-    }else if(msg.type==='register'){
-      registering=true;
-      try{
-        const cred=await B.F.createUserWithEmailAndPassword(B.authInstance(),msg.email,msg.password);
-        await B.create('users',cred.user.uid,{
-          name:msg.name,
-          fullTitleName:msg.name,
-          email:msg.email,
-          institution:msg.institution,
-          phone:msg.phone||'',
-          status:'pending',
-          chatAccess:false,
-          createdAt:B.stamp()
-        });
-      }finally{registering=false;}
-      close();
-      toast('Pendaftaran berhasil. Menunggu aktivasi admin.');
-      dashboard();
-    }else if(msg.type==='change'){
-      if(!me)throw new Error('Silakan masuk.');
-      const cred=B.F.EmailAuthProvider.credential(me.email,msg.current);
-      await B.F.reauthenticateWithCredential(me,cred);
-      await B.F.updatePassword(me,msg.next);
-      close();
-      toast('Password berhasil diperbarui.');
-    }
-  }catch(e){
-    const frame=document.querySelector('#modal iframe');
-    frame?.contentWindow?.postMessage({hauraAccountResult:{ok:false,message:B?.errorMessage(e)||e.message}},location.origin);
-  }
-});
-
-(async()=>{
-  try{
-    const mod=await import('./backend.js');
-    B=mod.B;
-    if(B?.configured){
-      publicSubscriptions.push(B.watch('settings',[B.F.where(B.F.documentId(),'==','public')],rows=>{
-        if(rows[0]) state.cms={...state.cms,...rows[0]};
-        schedulePublicRender();
-        checkPublicVerification();
-      },fail));
-      publicSubscriptions.push(B.watch('programs',[],rows=>{state.programs=rows;schedulePublicRender();scheduleRefreshSection();},fail));
-      publicSubscriptions.push(B.watch('news',[],rows=>{state.news=rows;schedulePublicRender();},fail));
-      publicSubscriptions.push(B.watch('alkes',[],rows=>{state.alkes=rows;scheduleRefreshSection();},fail));
-      publicSubscriptions.push(B.watch('donations',[],rows=>{state.donations=rows;schedulePublicRender();if(tab==='cms')renderCMS();},fail));
-      B.F.onAuthStateChanged(B.authInstance(),handleSession);
-    }else{
+  if(B?.configured){
+    try{
+      await B.F.reload(B.authInstance().currentUser).catch(()=>{});
+      await handleSession(B.authInstance().currentUser);
       publicRender();
-    }
-  }catch(e){
-    console.error(e);
-    publicRender();
+    }catch{}
   }
+});
+
+window.addEventListener('offline', async () => {
+  toast('Perangkat offline. Masuk ke mode Buku Digital Offline…');
+  resetRenderHashes();
   navRender();
-})();
+  if(me?.uid){
+    const saved = OfflineAuth.all()[me.uid];
+    if(saved){
+      await enterOfflineSession(saved);
+      return;
+    }
+  }
+  const activeSaved = OfflineAuth.getActiveAccount();
+  if(activeSaved){
+    await enterOfflineSession(activeSaved);
+    return;
+  }
+  publicRender();
+  if(!$('#portal-view').hidden) dashboard();
+});
+
+addEventListener('DOMContentLoaded',async()=>{
+  $('#privacy-link').textContent=`Ketentuan Layanan · ${author}`;
+  await refreshOfflineBookIndex();
+  publicRender();
+  navRender();
+
+  const {loadBackend}=await import('./backend.js');
+  B=await loadBackend();
+  if(!B.configured){
+    $('#hero-title').textContent='Layanan Portal Belum Dikonfigurasi';
+    $('#hero-description').textContent='Isi konfigurasi server pada assets/config.js untuk mengaktifkan data dan pendaftaran.';
+    return;
+  }
+
+  let publicHydrated = false;
+  const applyPublicSnapshot = (rows, key) => {
+    state[key] = rows;
+    if(key === 'cms' && rows.length){
+      const latestCms = rows[0];
+      const gate = latestCms.subscriptionGate || {enabled:false};
+      const charity = latestCms.charity || {enabled:true,title:'Celengan Amal Haura Institute',description:'',totalCollected:0,totalDistributed:0};
+      state.cms = {...state.cms, ...latestCms, subscriptionGate: gate, charity};
+      const acc = me?.uid ? OfflineAuth.all()[me.uid] : null;
+      if(acc){
+        acc.gate = gate;
+        OfflineAuth.writeAll({...OfflineAuth.all(), [me.uid]: acc});
+      }
+    }
+    if(!publicHydrated && state.programs.length && state.news.length){
+      publicHydrated = true;
+    }
+    schedulePublicRender();
+    checkPublicVerification();
+    if(me && profile && !admin && profile.status==='approved' && !isOffline()){
+      const gate = getAccessCheck();
+      if(gate.blocked && $('#portal-view') && !$('#portal-view').hidden){
+        renderSubscriptionLockScreen(gate);
+      }else if(!gate.blocked && $('#subscription-lock-view') && !$('#subscription-lock-view').hidden){
+        dashboard();
+      }
+    }
+  };
+
+  if(!isOffline()){
+    B.watch('cms',[],rows=>applyPublicSnapshot(rows,'cms'),fail);
+    B.watch('programs',[B.F.where('archived','==',false)],rows=>applyPublicSnapshot(rows,'programs'),fail);
+    B.watch('news',[B.F.where('archived','==',false)],rows=>applyPublicSnapshot(rows,'news'),fail);
+    B.watch('donations',[],rows=>applyPublicSnapshot(rows,'donations'),fail);
+  }
+
+  B.F.onAuthStateChanged(B.authInstance(),async user=>{
+    await handleSession(user);
+    await checkPublicVerification();
+  });
+
+  if(isOffline() && !me){
+    const activeSaved = OfflineAuth.getActiveAccount();
+    if(activeSaved){
+      await enterOfflineSession(activeSaved);
+    }
+  }
+});
