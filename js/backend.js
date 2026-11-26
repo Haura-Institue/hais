@@ -1,6 +1,12 @@
 import {driveConfig} from './drive-config.js';
 import {createBridge,revive,selectRows} from './drive-client.js';
-export const configured=/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(driveConfig.webAppUrl||'');
+
+const FALLBACK_WEB_APP_URL='https://script.google.com/macros/s/AKfycbxMrI2VcflA1JxS-kjSmYA7DW14R8NQbDhBUB7ZblPFMKN0k5bikt_GKYcaHYI8vjwbpQ/exec';
+const effectiveConfig={
+  ...driveConfig,
+  webAppUrl:String(driveConfig?.webAppUrl||'').trim()||FALLBACK_WEB_APP_URL
+};
+export const configured=/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(effectiveConfig.webAppUrl);
 
 const SESSION_KEY='haura_tab_session_v3';
 function readSavedSession(){
@@ -33,7 +39,7 @@ export const getServerTime=()=>latestServerTimeMs||Date.now();
 const auth={currentUser:initialSession?{...initialSession.user,getIdToken:async()=>sessionToken}:null};
 const authObservers=new Set();
 let cache={}, cacheUID=auth.currentUser?.uid||null, epoch=0, fileEpoch=0, inFlight=null;
-const bridge=createBridge(driveConfig,()=>auth?.currentUser), watchers=new Set(), blobs=new Map(), pendingFiles=new Map();
+const bridge=createBridge(effectiveConfig,()=>auth?.currentUser), watchers=new Set(), blobs=new Map(), pendingFiles=new Map();
 export const storageConfigured=bridge.configured;
 export const requireStorage=()=>{if(!storageConfigured)throw new Error('Konfigurasi webAppUrl di js/drive-config.js belum diisi.');};
 export async function init(){return configured;}
@@ -49,7 +55,7 @@ async function sync(){
   const job=(async()=>{try{const data=await bridge.call('snapshot');if(generation!==epoch || (auth?.currentUser?.uid||'')!==who)return;if(data?.__serverTime)recordServerTime(data.__serverTime);cache=data;emit();}catch(e){if(generation===epoch)for(const w of [...watchers])w.fail?.(e);if(/^Sesi|^Wajib mengganti/.test(e.message)&&auth.currentUser)setSession(null);throw e;}})();
   inFlight=job;try{await job;}finally{if(inFlight===job)inFlight=null;}
 }
-setInterval(()=>{if(watchers.size&&!document.hidden&&bridge.configured)sync().catch(()=>{});},Math.max(20000,driveConfig.pollMs||30000));
+setInterval(()=>{if(watchers.size&&!document.hidden&&bridge.configured)sync().catch(()=>{});},Math.max(20000,effectiveConfig.pollMs||30000));
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&watchers.size&&bridge.configured)sync().catch(()=>{});});
 function subscribe(c,filters,ok,fail,id){const w={c,filters,ok,fail,id,last:Symbol()};watchers.add(w);if(bridge.configured)queueMicrotask(()=>sync().catch(()=>{}));return()=>watchers.delete(w);}
 export const watch=(c,filters,ok,fail)=>subscribe(c,filters,ok,fail);
@@ -119,7 +125,7 @@ export function accountFrame(mode='login'){
     if(!d.data?.token||!d.data?.user?.uid)return;window.removeEventListener('message',handler);setSession(d.data);document.dispatchEvent(new Event('haura-account-complete'));
   };
   window.addEventListener('message',handler);setTimeout(()=>window.removeEventListener('message',handler),20*60*1000);
-  const src=driveConfig.webAppUrl+'?view=account&mode='+encodeURIComponent(mode)+'&channel='+channel+'&parentOrigin='+encodeURIComponent(location.origin);
+  const src=effectiveConfig.webAppUrl+'?view=account&mode='+encodeURIComponent(mode)+'&channel='+channel+'&parentOrigin='+encodeURIComponent(location.origin);
   return '<iframe title="Akun Haura" referrerpolicy="no-referrer" src="'+src+'" style="width:100%;height:540px;border:0;background:white"></iframe>';
 }
 export async function resetMember(uid){return bridge.call('authReset',{uid});}
