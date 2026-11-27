@@ -338,6 +338,22 @@ function youtubeEmbedURL(v){
   }
   return /^[A-Za-z0-9_-]{11}$/.test(id)?`https://www.youtube-nocookie.com/embed/${id}?autoplay=1&mute=1&loop=1&playlist=${id}&rel=0`:'';
 }
+/* Google Drive: tautan /file/d/ID/view, /open?id=ID, uc?id=ID, dan /file/d/ID/preview
+   TIDAK dapat dipakai langsung di <video src>. Drive hanya memutar video lewat
+   iframe preview. Tanpa ini, menempel tautan Drive di kolom "URL Video Beranda"
+   menghasilkan <video> kosong yang tidak pernah berputar. */
+function driveEmbedURL(v){
+  const u=safeURL(v);
+  if(!u)return '';
+  const parsed=new URL(u);
+  if(!/(^|\.)google\.com$/.test(parsed.hostname))return '';
+  let id='';
+  const m1=parsed.pathname.match(/\/file\/d\/([A-Za-z0-9_-]{10,})/);
+  if(m1)id=m1[1];
+  if(!id)id=parsed.searchParams.get('id')||'';
+  if(!id){const m2=parsed.pathname.match(/\/d\/([A-Za-z0-9_-]{10,})/);if(m2)id=m2[1];}
+  return /^[A-Za-z0-9_-]{10,}$/.test(id)?`https://drive.google.com/file/d/${id}/preview`:''; 
+}
 
 /* ============================================================================
    PREDIKAT OTOMATIS DARI NILAI EVALUASI & KONFIGURASI SERTIFIKAT
@@ -871,7 +887,8 @@ function publicRender(){
   const drivePath=!offline ? (state.cms.videoPath||'') : '';
   const rawUrl=(!offline && !drivePath) ? safeURL(state.cms.videoUrl) : '';
   const ytUrl=rawUrl ? youtubeEmbedURL(rawUrl) : '';
-  const directUrl=(rawUrl && !ytUrl) ? rawUrl : '';
+  const driveUrl=rawUrl ? driveEmbedURL(rawUrl) : '';
+  const directUrl=(rawUrl && !ytUrl && !driveUrl) ? rawUrl : '';
 
   if(drivePath && B?.storageConfigured){
     if(iframe){iframe.hidden=true;iframe.removeAttribute('src');}
@@ -886,6 +903,11 @@ function publicRender(){
   }else if(ytUrl && iframe){
     video.pause();video.removeAttribute('src');video.hidden=true;
     if(iframe.getAttribute('src')!==ytUrl)iframe.src=ytUrl;
+    iframe.hidden=false;
+    logo.hidden=true;
+  }else if(driveUrl && iframe){
+    video.pause();video.removeAttribute('src');video.hidden=true;
+    if(iframe.getAttribute('src')!==driveUrl)iframe.src=driveUrl;
     iframe.hidden=false;
     logo.hidden=true;
   }else if(directUrl){
@@ -4900,7 +4922,14 @@ B = backend;
     if(key === 'cms' && rows.length){
       const latestCms = rows[0];
       const gate = latestCms.subscriptionGate || {enabled:false};
-      const charity = latestCms.charity || {enabled:true,title:'Celengan Amal Haura Institute',description:'',totalCollected:0,totalDistributed:0};
+      const charityCfg = latestCms.charityConfig || {};
+      const charity = latestCms.charity || {
+        enabled: charityCfg.enabled !== false,
+        title: charityCfg.title || 'Celengan Amal Haura Institute',
+        description: charityCfg.description || '',
+        totalCollected: Number(charityCfg.totalCollected || 0),
+        totalDistributed: Number(charityCfg.totalDistributed || 0)
+      };
       state.cms = {...state.cms, ...latestCms, subscriptionGate: gate, charity};
       const acc = me?.uid ? OfflineAuth.all()[me.uid] : null;
       if(acc){
