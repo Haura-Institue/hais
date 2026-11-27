@@ -1,23 +1,11 @@
 /* HAURA v3.6 — JEMBATAN DATA (GitHub Pages <-> Google Apps Script + Drive)
    ============================================================================
    File ini MENGGANTIKAN js/backend.js versi 3.0 yang lama.
-
-   Masalah yang diperbaiki:
-   js/app.js versi 3.6 memanggil 16 fungsi yang TIDAK ADA di backend.js 3.0:
-     uploadFile, saveCMS, setMemberStatus, submitPaidEnrollment, submitInstallment,
-     directCashEnroll, confirmPayment(ada)/rejectPayment, confirmAccessPayment,
-     rejectAccessPayment, confirmChatPayment, rejectChatPayment, confirmAlkesOrder,
-     rejectAlkesOrder, confirmDonation, rejectDonation, functionsInstance
-   Setiap panggilan itu melempar "TypeError: B.xxx is not a function", sehingga
-   unggah foto/bukti/video GAGAL, pengaturan beranda GAGAL disimpan, chat GAGAL
-   terkirim, dan video beranda tidak pernah terunggah.
-
-   Selain itu path unggahan versi 3.6 (avatars/, paymentProofs/, banners/, hero/,
-   branding/, qris/, alkesCatalog/, certAssets/, chatPayments/, accessPayments/,
-   alkesOrders/, pmkDocs/, ebooks/*.html) TIDAK diizinkan oleh path_() di
-   apps-script/Code.gs. File ini memetakan path tersebut ke path yang sah.
-
-   Tidak ada token/password yang disimpan di file ini.
+   Sudah diperbaiki:
+   1. Urutan deklarasi `upload` sebelum ekspor objek `B`.
+   2. Pembersihan otomatis fungsi (`toDate`, dll.) sebelum `postMessage` agar
+      simpan konfigurasi sertifikat, CMS, dan pembaruan data tidak gagal
+      DataCloneError.
 */
 
 import {driveConfig} from './drive-config.js';
@@ -58,10 +46,41 @@ function recordServerTime(ms){
 }
 export const getServerTime=()=>latestServerTimeMs||Date.now();
 
+/* Bersihkan fungsi/metode (seperti ()=>new Date(value.__hauraTime)) sebelum
+   data dikirim melalui window.postMessage ke iframe Apps Script. */
+function sanitizeCloneable(value,seen=new WeakSet()){
+  if(value===null||typeof value!=='object'){
+    return (typeof value==='function'||typeof value==='symbol')?undefined:value;
+  }
+  if(value instanceof Date)return new Date(value.getTime());
+  if(value instanceof ArrayBuffer||ArrayBuffer.isView(value))return value;
+  if(typeof Blob!=='undefined'&&value instanceof Blob)return value;
+  if(seen.has(value))return undefined;
+  seen.add(value);
+  if(Array.isArray(value)){
+    return value.map(item=>{
+      const clean=sanitizeCloneable(item,seen);
+      return clean===undefined?null:clean;
+    });
+  }
+  const out={};
+  for(const [k,v] of Object.entries(value)){
+    if(typeof v==='function'||typeof v==='symbol'||v===undefined)continue;
+    const clean=sanitizeCloneable(v,seen);
+    if(clean!==undefined)out[k]=clean;
+  }
+  return out;
+}
+
 const auth={currentUser:initialSession?{...initialSession.user,getIdToken:async()=>sessionToken}:null};
 const authObservers=new Set();
 let cache={}, cacheUID=auth.currentUser?.uid||null, epoch=0, fileEpoch=0, inFlight=null, adminFlag=false;
-const bridge=createBridge(effectiveConfig,()=>auth?.currentUser), watchers=new Set(), blobs=new Map(), pendingFiles=new Map();
+const rawBridge=createBridge(effectiveConfig,()=>auth?.currentUser);
+const bridge={
+  ...rawBridge,
+  call:(action,args)=>rawBridge.call(action,args===undefined?undefined:sanitizeCloneable(args))
+};
+const watchers=new Set(), blobs=new Map(), pendingFiles=new Map();
 export const storageConfigured=bridge.configured;
 export const requireStorage=()=>{if(!storageConfigured)throw new Error('Konfigurasi webAppUrl di js/drive-config.js belum diisi.');};
 export async function init(){return configured;}
@@ -69,10 +88,7 @@ export const authInstance=()=>auth;
 export const dbInstance=()=>null;
 export const stamp=()=>({__serverTime:true});
 
-/* Koleksi 'cms' di js/app.js sebenarnya dokumen settings/public di server.
-   Tanpa alias ini, watch('cms') selalu menerima array kosong sehingga judul,
-   logo, banner, dan videoPath yang disimpan admin TIDAK PERNAH sampai ke
-   beranda — video tidak pernah berputar walau sudah diunggah. */
+/* Koleksi 'cms' di js/app.js sebenarnya dokumen settings/public di server. */
 const ALIAS={cms:{c:'settings',id:'public'}};
 function collectionRows(c){
   if(c==='cms'){
@@ -135,8 +151,6 @@ export const remove=(c,id)=>mutate([{op:'remove',c,id}]);
 
 /* ============================================================================
    1. PEMETAAN PATH UNGGAHAN
-   js/app.js memakai nama folder versi 3.6 yang tidak ada di daftar putih
-   path_() pada apps-script/Code.gs. Fungsi ini menerjemahkannya.
    ========================================================================== */
 const seg=s=>{
   const v=String(s??'').replace(/[^A-Za-z0-9-]/g,'').slice(0,100);
@@ -168,9 +182,7 @@ export function toServerPath(path){
 }
 
 /* ============================================================================
-   2. UNGGAH BERKAS (foto, bukti bayar, banner, logo, video, e-book HTML)
-   Batas keras server: base64 <= 13.981.024 karakter dan isi <= 5 MB
-   (10 MB khusus certificates/). Video dibatasi 5 MB oleh server.
+   2. UNGGAH BERKAS
    ========================================================================== */
 function mimeOf(file){return String(file?.type||'application/octet-stream').split(';')[0].trim().toLowerCase();}
 export function validateFile(file,allowed=['image/jpeg','image/png','image/webp'],max=5*1024*1024){
@@ -199,7 +211,6 @@ export async function uploadFile(path,file,opts={}){
   const mime=mimeOf(file);
   const serverPath=toServerPath(path);
 
-  // Amal (donasi) ditulis oleh server lewat endpoint donate, bukan fileWrite.
   if(/^public\/donations\//.test(serverPath)){
     const base64=await readBase64(file);
     const token='donation-upload:'+seg(path);
@@ -217,7 +228,7 @@ export async function uploadFile(path,file,opts={}){
 }
 
 /* ============================================================================
-   3. SIMPAN PENGATURAN BERANDA (setara B.saveCMS)
+   3. SIMPAN PENGATURAN BERANDA
    ========================================================================== */
 function mapCertConfig(cfg){
   const c={...cfg};
@@ -253,16 +264,11 @@ export async function saveCMS(cms){
 }
 
 /* ============================================================================
-   4. TULIS DATA: add() dirutekan ke endpoint transaksi yang benar
-   writeOne_ menolak chatPayments/accessPayments/alkesOrders/expenses/
-   evaluationSubmissions dan paksa lewat endpoint khusus.
+   4. TULIS DATA
    ========================================================================== */
 export async function add(c,data){
   requireStorage();
   if(c==='donations'){
-    /* Pencatatan penyaluran dana oleh admin memakai status 'distributed',
-       bukan donasi masuk. Tanpa cabang ini, penyaluran amal ikut tercatat
-       sebagai donasi pending dan saldo Celengan Amal menjadi salah. */
     if(data?.status==='distributed'||data?.distributionTarget){
       await runAndSync('reviewDonation',{
         mode:'distribute',
@@ -322,10 +328,6 @@ export async function add(c,data){
   }
   const id=crypto.randomUUID();
   const row={...data};
-  /* Server hanya menampilkan baris dengan published===true (canRead_), dan
-     orderAlkes menolak produk published!==true. Form admin tidak pernah
-     mengirim published, jadi program/produk/berita baru tidak pernah terlihat
-     peserta. Default di sini menutup celah itu. */
   if(['programs','news','alkes'].includes(c)&&typeof row.published!=='boolean')row.published=true;
   if(row.archived===undefined&&['programs','news','alkes'].includes(c))row.archived=false;
   await create(c,id,row);
@@ -333,7 +335,7 @@ export async function add(c,data){
 }
 
 /* ============================================================================
-   5. FUNGSI YANG HILANG DI backend.js 3.0 (penyebab utama fitur gagal)
+   5. FUNGSI TRANSAKSI & VALIDASI ADMIN
    ========================================================================== */
 export async function setMemberStatus(userId,status){
   return mutate([{op:'patch',c:'users',id:userId,data:{status}}]);
