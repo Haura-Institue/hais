@@ -1,5 +1,5 @@
 // Naikkan VERSION setiap rilis (contoh v3.5.2).
-const VERSION = 'haura-v3.5.3';
+const VERSION = 'haura-v3.5.4';
 const CACHE = VERSION + '-shell';
 const BASE = new URL('./', self.location.href);
 const FILES = ["./", "index.html", "assets/app.css", "assets/logo.png", "manifest.webmanifest", "js/app.js", "js/finance.js", "js/pwa.js", "js/backend.js", "js/drive-config.js", "js/drive-client.js", "vendor/pdf.js", "assets/icons/icon-192.png", "assets/icons/apple-touch-icon.png", "assets/icons/icon-512.png", "assets/icons/maskable-192.png", "assets/icons/maskable-512.png"].map(path => new URL(path, BASE).href);
