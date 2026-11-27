@@ -563,6 +563,8 @@ export async function addExpense(payload){return runAndSync('addExpense',payload
 export async function removeExpense(expenseId){return runAndSync('removeExpense',{expenseId});}
 export async function freeEnroll(programId){return runAndSync('freeEnroll',{programId});}
 
+export const upload=uploadFile;
+
 export const B={
   configured,getServerTime,storageConfigured,requireStorage,init,authInstance,dbInstance,stamp,
   watch,read,create,patch,remove,add,F,validateFile,upload,uploadFile,publicFileURL,fileURL,
@@ -574,5 +576,4 @@ export const B={
   resetEvaluationSubmission,subscribeChat,reviewChatPayment,subscribeAccess,reviewAccessPayment,
   setUserAccess,donate,reviewDonation,orderAlkes,reviewAlkesOrder,addExpense,removeExpense,freeEnroll
 };
-export const upload=uploadFile;
 export default B;
