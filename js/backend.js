@@ -3,9 +3,9 @@
    File ini MENGGANTIKAN js/backend.js versi 3.0 yang lama.
    Sudah diperbaiki:
    1. Urutan deklarasi `upload` sebelum ekspor objek `B`.
-   2. Pembersihan otomatis fungsi (`toDate`, dll.) sebelum `postMessage` agar
-      simpan konfigurasi sertifikat, CMS, dan pembaruan data tidak gagal
-      DataCloneError.
+   2. Pembersihan fungsi (`toDate`), konversi `{ __hauraTime }` ke string ISO,
+      serta penghapusan metadata baca-saja (`updatedAt`, `createdAt`, `updatedBy`)
+      agar lolos validasi keamanan kolom di apps-script/Code.gs.
 */
 
 import {driveConfig} from './drive-config.js';
@@ -46,11 +46,15 @@ function recordServerTime(ms){
 }
 export const getServerTime=()=>latestServerTimeMs||Date.now();
 
-/* Bersihkan fungsi/metode (seperti ()=>new Date(value.__hauraTime)) sebelum
-   data dikirim melalui window.postMessage ke iframe Apps Script. */
+/* Bersihkan fungsi/metode dan ubah objek timestamp {__hauraTime} menjadi string ISO
+   agar tidak memicu DataCloneError maupun penolakan "Nama kolom dilarang." di server. */
 function sanitizeCloneable(value,seen=new WeakSet()){
   if(value===null||typeof value!=='object'){
     return (typeof value==='function'||typeof value==='symbol')?undefined:value;
+  }
+  if(Object.prototype.hasOwnProperty.call(value,'__hauraTime')){
+    const ms=Number(value.__hauraTime);
+    return Number.isFinite(ms)?new Date(ms).toISOString():null;
   }
   if(value instanceof Date)return new Date(value.getTime());
   if(value instanceof ArrayBuffer||ArrayBuffer.isView(value))return value;
@@ -66,6 +70,7 @@ function sanitizeCloneable(value,seen=new WeakSet()){
   const out={};
   for(const [k,v] of Object.entries(value)){
     if(typeof v==='function'||typeof v==='symbol'||v===undefined)continue;
+    if(k.startsWith('__')&&k!=='__serverTime')continue;
     const clean=sanitizeCloneable(v,seen);
     if(clean!==undefined)out[k]=clean;
   }
@@ -228,16 +233,24 @@ export async function uploadFile(path,file,opts={}){
 }
 
 /* ============================================================================
-   3. SIMPAN PENGATURAN BERANDA
+   3. SIMPAN PENGATURAN BERANDA & SERTIFIKAT
    ========================================================================== */
 function mapCertConfig(cfg){
   const c={...cfg};
+  delete c.id;
+  delete c.updatedAt;
+  delete c.createdAt;
+  delete c.updatedBy;
   if(c.signaturePath)c.signaturePath=toServerPath(c.signaturePath);
   if(c.stampPath)c.stampPath=toServerPath(c.stampPath);
   return c;
 }
 function mapCMS(cms){
   const data={...cms};
+  delete data.id;
+  delete data.updatedAt;
+  delete data.createdAt;
+  delete data.updatedBy;
   delete data.charity;
   delete data.bannersRaw;
   if(cms.charity){
