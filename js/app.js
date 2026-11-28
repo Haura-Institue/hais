@@ -4957,6 +4957,7 @@ B = backend;
     B.watch('programs',[B.F.where('archived','==',false)],rows=>applyPublicSnapshot(rows,'programs'),fail);
     B.watch('news',[B.F.where('archived','==',false)],rows=>applyPublicSnapshot(rows,'news'),fail);
     B.watch('donations',[],rows=>applyPublicSnapshot(rows,'donations'),fail);
+    B.watch('alkes',[B.F.where('archived','==',false)],rows=>{state.alkes=rows;scheduleRefreshSection();},fail);
   }
 
   B.F.onAuthStateChanged(B.authInstance(),async user=>{
