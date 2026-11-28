@@ -1,11 +1,14 @@
 /* HAURA v3.6 — JEMBATAN DATA (GitHub Pages <-> Google Apps Script + Drive)
    ============================================================================
-   File ini MENGGANTIKAN js/backend.js versi 3.0 yang lama.
    Sudah diperbaiki:
    1. Urutan deklarasi `upload` sebelum ekspor objek `B`.
-   2. Pembersihan fungsi (`toDate`), konversi `{ __hauraTime }` ke string ISO,
-      serta penghapusan metadata baca-saja (`updatedAt`, `createdAt`, `updatedBy`)
-      agar lolos validasi keamanan kolom di apps-script/Code.gs.
+   2. Pembersihan fungsi (`toDate`) & konversi `{ __hauraTime }` ke ISO string
+      sebelum `postMessage` (mencegah DataCloneError).
+   3. Penghapusan otomatis kolom terlarang (`id`, `__proto__`, `constructor`,
+      `prototype`) pada `op.data` sebelum dikirim ke `Code.gs` (mencegah error
+      "Nama kolom dilarang.").
+   4. Pemetaan path otomatis (`certAssets/`, `banners/`, `branding/`, `hero/`,
+      `qris/`) pada `patch()` maupun `create()` untuk koleksi `settings`.
 */
 
 import {driveConfig} from './drive-config.js';
@@ -47,7 +50,7 @@ function recordServerTime(ms){
 export const getServerTime=()=>latestServerTimeMs||Date.now();
 
 /* Bersihkan fungsi/metode dan ubah objek timestamp {__hauraTime} menjadi string ISO
-   agar tidak memicu DataCloneError maupun penolakan "Nama kolom dilarang." di server. */
+   agar aman saat dikirim via window.postMessage ke iframe Apps Script. */
 function sanitizeCloneable(value,seen=new WeakSet()){
   if(value===null||typeof value!=='object'){
     return (typeof value==='function'||typeof value==='symbol')?undefined:value;
@@ -73,6 +76,21 @@ function sanitizeCloneable(value,seen=new WeakSet()){
     if(k.startsWith('__')&&k!=='__serverTime')continue;
     const clean=sanitizeCloneable(v,seen);
     if(clean!==undefined)out[k]=clean;
+  }
+  return out;
+}
+
+/* Hapus properti yang dilarang fungsi time_() di Code.gs ('id', '__proto__', dll.)
+   dari payload data sebelum dikirim ke mutate(). */
+function stripForbiddenKeys(value,seen=new WeakSet()){
+  if(value===null||typeof value!=='object')return value;
+  if(seen.has(value))return undefined;
+  seen.add(value);
+  if(Array.isArray(value))return value.map(item=>stripForbiddenKeys(item,seen));
+  const out={};
+  for(const [k,v] of Object.entries(value)){
+    if(k==='id'||k==='__proto__'||k==='constructor'||k==='prototype')continue;
+    out[k]=stripForbiddenKeys(v,seen);
   }
   return out;
 }
@@ -145,10 +163,19 @@ export async function read(c,id){
   return revive(result);
 }
 async function runAndSync(action,args){const result=await bridge.call(action,args);if(inFlight)await inFlight.catch(()=>{});await sync().catch(()=>{});return result;}
-async function mutate(ops){return runAndSync('mutate',{ops});}
-export const create=(c,id,data)=>mutate([{op:'set',c,id,data}]);
+async function mutate(ops){
+  const cleanOps=(Array.isArray(ops)?ops:[]).map(op=>({
+    ...op,
+    data:op.data!==undefined?stripForbiddenKeys(op.data):undefined
+  }));
+  return runAndSync('mutate',{ops:cleanOps});
+}
+export const create=(c,id,data)=>{
+  const row=c==='settings'?mapCMS(data||{}):data;
+  return mutate([{op:'set',c,id,data:row}]);
+};
 export async function patch(c,id,data){
-  const row={...data};
+  const row=c==='settings'?mapCMS(data||{}):{...data};
   if(['programs','news','alkes'].includes(c)&&typeof row.published!=='boolean'&&row.archived===undefined)row.published=true;
   return mutate([{op:'patch',c,id,data:row}]);
 }
@@ -163,22 +190,15 @@ const seg=s=>{
 };
 const PATH_RULES=[
   [/^avatars\/([^/]+)\/([^/]+)$/,m=>'profiles/'+seg(m[1])+'/'+seg(m[2])],
-  [/^paymentProofs\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])],
-  [/^accessPayments\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])],
-  [/^chatPayments\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])],
-  [/^alkesOrders\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])],
-  [/^pmkDocs\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])],
-  [/^certificates\/([^/]+)\/([^/]+)$/,m=>'certificates/'+seg(m[1])+'/'+seg(m[2])],
-  [/^ebooks\/([^/]+)\/([^/]+)$/,m=>'ebooks/'+seg(m[1])+'/'+seg(m[2])],
-  [/^banners\/([^/]+)$/,m=>'public/banners/'+seg(m[1])],
-  [/^branding\/([^/]+)$/,m=>'public/logo/'+seg(m[1])],
-  [/^hero\/([^/]+)$/,m=>'public/videos/'+seg(m[1])],
-  [/^qris\/([^/]+)$/,m=>'public/qris/'+seg(m[1])],
-  [/^alkesCatalog\/([^/]+)$/,m=>'public/alkes/'+seg(m[1])],
-  [/^certAssets\/([^/]+)$/,m=>'public/sign/'+seg(m[1])],
-  [/^donations\/([^/]+)$/,m=>'public/donations/'+seg(m[1])]
+  [/^paymentProofs\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])], [/^accessPayments\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])],
+  [/^chatPayments\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])], [/^alkesOrders\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])],
+  [/^pmkDocs\/([^/]+)\/([^/]+)$/,m=>'proofs/'+seg(m[1])+'/'+seg(m[2])], [/^certificates\/([^/]+)\/([^/]+)$/,m=>'certificates/'+seg(m[1])+'/'+seg(m[2])],
+  [/^ebooks\/([^/]+)\/([^/]+)$/,m=>'ebooks/'+seg(m[1])+'/'+seg(m[2])], [/^banners\/([^/]+)$/,m=>'public/banners/'+seg(m[1])],
+  [/^branding\/([^/]+)$/,m=>'public/logo/'+seg(m[1])], [/^hero\/([^/]+)$/,m=>'public/videos/'+seg(m[1])],
+  [/^qris\/([^/]+)$/,m=>'public/qris/'+seg(m[1])], [/^alkesCatalog\/([^/]+)$/,m=>'public/alkes/'+seg(m[1])],
+  [/^certAssets\/([^/]+)$/,m=>'public/sign/'+seg(m[1])], [/^donations\/([^/]+)$/,m=>'public/donations/'+seg(m[1])]
 ];
-const SERVER_PATH=/^(?:profiles|proofs|certificates|ebooks)\/[A-Za-z0-9_-]+\/[A-Za-z0-9-]+$|^public\/(?:qris|logo|alkes|videos|certs|banners|charity|donations|sign)\/[A-Za-z0-9-]+$/;
+const SERVER_PATH=/^(?:profiles|proofs|certificates|ebooks)\/[A-Za-z0-9_-]+\/[A-Za-z0-9-]+$\vert{}^public\/(?:qris\vert{}logo\vert{}alkes\vert{}videos\vert{}certs\vert{}banners\vert{}charity\vert{}donations\vert{}sign)\/[A-Za-z0-9-]+$/;
 export function toServerPath(path){
   const p=String(path||'');
   if(SERVER_PATH.test(p))return p;
@@ -264,11 +284,22 @@ function mapCMS(cms){
       totalDistributed:Number(ch.totalDistributed||0)
     };
   }
+  if(data.charityConfig&&typeof data.charityConfig==='object'&&data.charityConfig.qrisPath){
+    data.charityConfig={...data.charityConfig,qrisPath:toServerPath(data.charityConfig.qrisPath)};
+  }
   if(cms.qrisPath)data.qrisPath=toServerPath(cms.qrisPath);
   if(cms.logoPath)data.logoPath=toServerPath(cms.logoPath);
   if(cms.videoPath)data.videoPath=toServerPath(cms.videoPath);
   if(cms.certConfig)data.certConfig=mapCertConfig(cms.certConfig);
-  data.banners=Array.isArray(cms.banners)?cms.banners.map(b=>({...b,imagePath:toServerPath(b.imagePath)})).slice(0,20):[];
+  if(Array.isArray(cms.banners)){
+    data.banners=cms.banners.map(b=>({...b,imagePath:toServerPath(b.imagePath)})).slice(0,20);
+  }
+  if(cms.bannerConfig&&typeof cms.bannerConfig==='object'){
+    data.bannerConfig={...cms.bannerConfig};
+    if(Array.isArray(cms.bannerConfig.slides)){
+      data.bannerConfig.slides=cms.bannerConfig.slides.map(s=>({...s,imagePath:toServerPath(s.imagePath)})).slice(0,20);
+    }
+  }
   return data;
 }
 export async function saveCMS(cms){
@@ -307,288 +338,3 @@ export async function add(c,data){
   if(c==='accessPayments'){
     await runAndSync('subscribeAccess',{proofPath:toServerPath(data?.proofPath)});
     await sync().catch(()=>{});
-    return {id:data?.id||''};
-  }
-  if(c==='chatPayments'){
-    await runAndSync('subscribeChat',{proofPath:toServerPath(data?.proofPath)});
-    await sync().catch(()=>{});
-    return {id:data?.id||''};
-  }
-  if(c==='alkesOrders'){
-    await runAndSync('orderAlkes',{
-      items:data?.items||[],
-      proofPath:toServerPath(data?.proofPath),
-      shippingNote:String(data?.shippingNote||'')
-    });
-    await sync().catch(()=>{});
-    return {id:data?.id||''};
-  }
-  if(c==='expenses'){
-    const res=await runAndSync('addExpense',{
-      programId:String(data?.programId||''),
-      category:String(data?.category||'BMHP'),
-      description:String(data?.description||''),
-      amount:Number(data?.amount||0),
-      date:String(data?.date||'')
-    });
-    await sync().catch(()=>{});
-    return {id:res?.id||''};
-  }
-  if(c==='settings'){
-    const id='public';
-    await mutate([{op:'set',c,id,data:mapCMS(data)}]);
-    return {id};
-  }
-  const id=crypto.randomUUID();
-  const row={...data};
-  if(['programs','news','alkes'].includes(c)&&typeof row.published!=='boolean')row.published=true;
-  if(row.archived===undefined&&['programs','news','alkes'].includes(c))row.archived=false;
-  await create(c,id,row);
-  return {id};
-}
-
-/* ============================================================================
-   5. FUNGSI TRANSAKSI & VALIDASI ADMIN
-   ========================================================================== */
-export async function setMemberStatus(userId,status){
-  return mutate([{op:'patch',c:'users',id:userId,data:{status}}]);
-}
-export async function submitPaidEnrollment(payload){
-  return runAndSync('paidEnroll',{
-    programId:payload?.programId,
-    amount:Number(payload?.amount||0),
-    proofPath:toServerPath(payload?.proofPath),
-    method:'transfer'
-  });
-}
-export async function submitInstallment(payload){
-  return runAndSync('submitPayment',{
-    enrollmentId:payload?.enrollmentId,
-    amount:Number(payload?.amount||0),
-    proofPath:toServerPath(payload?.proofPath),
-    method:'transfer'
-  });
-}
-export async function directCashEnroll(payload){
-  return runAndSync('recordCashPayment',{
-    userId:payload?.userId,
-    programId:payload?.programId,
-    amount:Number(payload?.amount||0),
-    note:String(payload?.note||''),
-    label:String(payload?.label||'')
-  });
-}
-export async function submitPayment(payload){
-  const enr=String(payload?.enrollmentId||'');
-  if(enr)return submitInstallment(payload);
-  return runAndSync('paidEnroll',payload);
-}
-export async function confirmPayment(payload){
-  return runAndSync('confirmPayment',{...payload,decision:'confirmed'});
-}
-export async function rejectPayment(payload){
-  return runAndSync('confirmPayment',{...payload,decision:'rejected'});
-}
-export async function confirmAccessPayment(payload){
-  return runAndSync('reviewAccessPayment',{paymentId:payload?.paymentId||payload?.id,decision:'confirmed',note:String(payload?.note||'')});
-}
-export async function rejectAccessPayment(payload){
-  return runAndSync('reviewAccessPayment',{paymentId:payload?.paymentId||payload?.id,decision:'rejected',note:String(payload?.note||'')});
-}
-export async function confirmChatPayment(payload){
-  return runAndSync('reviewChatPayment',{paymentId:payload?.paymentId||payload?.id,decision:'confirmed',note:String(payload?.note||'')});
-}
-export async function rejectChatPayment(payload){
-  return runAndSync('reviewChatPayment',{paymentId:payload?.paymentId||payload?.id,decision:'rejected',note:String(payload?.note||'')});
-}
-export async function confirmAlkesOrder(payload){
-  return runAndSync('reviewAlkesOrder',{orderId:payload?.orderId||payload?.id,decision:'confirmed',note:String(payload?.note||'')});
-}
-export async function rejectAlkesOrder(payload){
-  return runAndSync('reviewAlkesOrder',{orderId:payload?.orderId||payload?.id,decision:'rejected',note:String(payload?.note||'')});
-}
-export async function confirmDonation(payload){
-  return runAndSync('reviewDonation',{donationId:payload?.donationId||payload?.id,decision:'confirmed',published:true,note:String(payload?.note||'')});
-}
-export async function rejectDonation(payload){
-  return runAndSync('reviewDonation',{donationId:payload?.donationId||payload?.id,decision:'rejected',published:false,note:String(payload?.note||'')});
-}
-export const functionsInstance=()=>({app:'haura',region:'apps-script'});
-
-async function sendChatMessage(payload){
-  const uid=auth.currentUser?.uid;
-  if(!uid)throw new Error('Silakan masuk terlebih dahulu.');
-  const peer=String(payload?.peerId||uid);
-  const id=crypto.randomUUID();
-  const isSbar=payload?.kind==='sbar';
-  const body=isSbar
-    ?{senderId:uid,kind:'sbar',text:'',sbar:{s:String(payload?.sbar?.s||''),b:String(payload?.sbar?.b||''),a:String(payload?.sbar?.a||''),r:String(payload?.sbar?.r||'')},createdAt:stamp()}
-    :{senderId:uid,kind:'text',text:String(payload?.text||'').slice(0,4000),createdAt:stamp()};
-  const write=role=>mutate([{op:'set',c:'conversations/'+peer+'/messages',id,data:{...body,senderRole:role}}]);
-  const roles=adminFlag?['admin','peserta']:['peserta','admin'];
-  let lastError=null;
-  for(const role of roles){
-    try{await write(role);return {ok:true};}catch(e){lastError=e;}
-  }
-  throw lastError||new Error('Pesan gagal dikirim.');
-}
-
-/* ============================================================================
-   6. KOMPATIBILITAS API GAYA FIREBASE YANG DIPAKAI js/app.js
-   ========================================================================== */
-export const F={
-  where:(field,op,value)=>{if(op!=='==')throw new Error('Filter tidak didukung.');return {type:'where',field,value};},
-  orderBy:(field,direction)=>({type:'orderBy',field,direction}),limit:count=>({type:'limit',count}),
-  documentId:()=>'id',
-  doc:(_db,c,id)=>({c,id}),onSnapshot:(ref,ok,fail)=>subscribe(ref.c,[],ok,fail,ref.id),
-  httpsCallable:(_inst,name)=>{
-    if(name==='sendMessage')return sendChatMessage;
-    return async()=>{throw new Error('Fungsi '+name+' belum tersedia.');};
-  },
-  async getIdTokenResult(){
-    try{
-      const identity=await bridge.call('identity');
-      if(identity?.serverTime)recordServerTime(identity.serverTime);
-      adminFlag=identity?.admin===true;
-      return {claims:{admin:adminFlag}};
-    }catch(e){
-      if(/^Sesi|^Wajib mengganti/.test(e.message)&&auth.currentUser)setSession(null);
-      throw e;
-    }
-  },
-  onAuthStateChanged:(_a,cb)=>{authObservers.add(cb);queueMicrotask(()=>cb(auth.currentUser));return()=>authObservers.delete(cb);},
-  async signOut(){try{if(auth.currentUser)await bridge.call('authLogout');}finally{setSession(null);}},
-  async reload(){const id=await bridge.call('identity');if(id?.serverTime)recordServerTime(id.serverTime);adminFlag=id?.admin===true;},
-  writeBatch:()=>{const ops=[];return {update:(ref,data)=>ops.push({op:'patch',...ref,data}),commit:()=>mutate(ops)};}
-};
-
-export const publicFileURL=()=>'';
-export async function fileURL(path){
-  const key=String(path||'');
-  if(!key)throw new Error('Path berkas kosong.');
-  if(blobs.has(key))return blobs.get(key);
-  if(pendingFiles.has(key))return pendingFiles.get(key);
-  const generation=fileEpoch;
-  const task=(async()=>{
-    const data=await bridge.call('fileRead',{path:key});
-    if(fileEpoch!==generation)throw new Error('Sesi berubah.');
-    const bytes=Uint8Array.from(atob(data.base64),c=>c.charCodeAt(0));
-    const url=URL.createObjectURL(new Blob([bytes],{type:data.mime}));
-    blobs.set(key,url);
-    return url;
-  })();
-  pendingFiles.set(key,task);
-  try{return await task;}finally{if(pendingFiles.get(key)===task)pendingFiles.delete(key);}
-}
-export async function readHtmlFile(path){
-  const data=await bridge.call('fileRead',{path:toServerPath(path)});
-  if(data?.html!==undefined)return data.html;
-  if(data?.base64){
-    const bytes=Uint8Array.from(atob(data.base64),c=>c.charCodeAt(0));
-    return new TextDecoder('utf-8').decode(bytes);
-  }
-  throw new Error('Konten buku digital tidak ditemukan.');
-}
-export async function removeFile(path){
-  const target=toServerPath(path);
-  await bridge.call('fileRemove',{path:target});
-  if(blobs.has(target))URL.revokeObjectURL(blobs.get(target));
-  blobs.delete(target);
-  if(blobs.has(path))URL.revokeObjectURL(blobs.get(path));
-  blobs.delete(path);
-}
-export function clearFiles(){
-  fileEpoch++;
-  for(const url of blobs.values())URL.revokeObjectURL(url);
-  blobs.clear();pendingFiles.clear();donationUploads.clear();
-}
-export function errorMessage(e){return e?.message||'Operasi gagal. Periksa koneksi internet.';}
-
-function setSession(data){
-  if(data?.serverTime)recordServerTime(data.serverTime);
-  writeSavedSession(data);
-  sessionToken=data?.token||'';
-  auth.currentUser=data?{...data.user,getIdToken:async()=>sessionToken}:null;
-  adminFlag=false;
-  epoch++;cache={};cacheUID=auth.currentUser?.uid||'';inFlight=null;clearFiles();
-  for(const w of watchers)w.last=Symbol();
-  for(const cb of authObservers)cb(auth.currentUser);
-  if(configured)queueMicrotask(()=>sync().catch(()=>{}));
-}
-export function accountFrame(mode='login'){
-  requireStorage();const channel=crypto.randomUUID();let target,origin;
-  const handler=event=>{
-    const d=event.data;
-    if(!d||d.channel!==channel||(!/^https:\/\/(?:[a-z0-9-]+\.)?googleusercontent\.com$/.test(event.origin)&&event.origin!=='https://script.google.com'))return;
-    if(d.type==='haura-account-ready'&&!target){
-      target=event.source;origin=event.origin;
-      if(mode==='change')target.postMessage({type:'haura-account-session',channel,token:sessionToken},origin);
-      return;
-    }
-    if(d.type!=='haura-account-done'||event.source!==target||event.origin!==origin)return;
-    if(!d.data?.token||!d.data?.user?.uid)return;
-    window.removeEventListener('message',handler);
-    const modal=document.querySelector('#modal');
-    if(modal?.open){modal.close();const body=document.querySelector('#modal-body');if(body)body.innerHTML='';}
-    setSession(d.data);
-    document.dispatchEvent(new Event('haura-account-complete'));
-  };
-  window.addEventListener('message',handler);
-  setTimeout(()=>window.removeEventListener('message',handler),20*60*1000);
-  const src=effectiveConfig.webAppUrl+'?view=account&mode='+encodeURIComponent(mode)+'&channel='+channel+'&parentOrigin='+encodeURIComponent(location.origin);
-  return '<iframe title="Akun Haura" referrerpolicy="no-referrer" src="'+src+'" style="width:100%;height:540px;border:0;background:white"></iframe>';
-}
-export async function resetMember(uid){return bridge.call('authReset',{uid});}
-export async function paidEnroll(payload){return submitPaidEnrollment(payload);}
-export async function recordCashPayment(payload){
-  const [uId,pId]=String(payload?.enrollmentId||'').split('_');
-  return runAndSync('recordCashPayment',{...payload,userId:payload?.userId||uId,programId:payload?.programId||pId});
-}
-export async function verifyReceipt(receiptNumber){
-  const found=await bridge.call('verifyReceipt',{receiptNumber});
-  return found?{valid:true,receipt:found}:{valid:false,receipt:null};
-}
-export async function saveEvaluation(payload){return runAndSync('saveEvaluation',payload);}
-export async function saveCertConfig(payload){
-  const args=payload&&Object.prototype.hasOwnProperty.call(payload,'certConfig')?payload:{certConfig:payload};
-  if(args.certConfig)args.certConfig=mapCertConfig(args.certConfig);
-  return runAndSync('saveCertConfig',args);
-}
-export async function startEvaluation(payload){
-  const args=typeof payload==='string'?{evaluationId:payload}:payload;
-  const result=await runAndSync('startEvaluation',args);
-  if(result?.serverTime)recordServerTime(result.serverTime);
-  return result;
-}
-export async function submitEvaluation(payload){return runAndSync('submitEvaluation',payload);}
-export async function resetEvaluationSubmission(payload){return runAndSync('resetEvaluationSubmission',payload);}
-export async function subscribeChat(payload){return runAndSync('subscribeChat',payload);}
-export async function reviewChatPayment(payload){return runAndSync('reviewChatPayment',payload);}
-export async function subscribeAccess(payload){return runAndSync('subscribeAccess',payload);}
-export async function reviewAccessPayment(payload){return runAndSync('reviewAccessPayment',payload);}
-export async function setUserAccess(payload){return runAndSync('setUserAccess',payload);}
-export async function donate(payload){return runAndSync('donate',payload);}
-export async function reviewDonation(payload){
-  const args=payload?.decision==='distribute'?{...payload,mode:'distribute',note:payload.note||payload.distributionTarget||''}:payload;
-  return runAndSync('reviewDonation',args);
-}
-export async function orderAlkes(payload){return runAndSync('orderAlkes',payload);}
-export async function reviewAlkesOrder(payload){return runAndSync('reviewAlkesOrder',payload);}
-export async function addExpense(payload){return runAndSync('addExpense',payload);}
-export async function removeExpense(expenseId){return runAndSync('removeExpense',{expenseId});}
-export async function freeEnroll(programId){return runAndSync('freeEnroll',{programId});}
-
-export const upload=uploadFile;
-
-export const B={
-  configured,getServerTime,storageConfigured,requireStorage,init,authInstance,dbInstance,stamp,
-  watch,read,create,patch,remove,add,F,validateFile,upload,uploadFile,publicFileURL,fileURL,
-  readHtmlFile,removeFile,clearFiles,errorMessage,accountFrame,resetMember,paidEnroll,submitPayment,
-  submitPaidEnrollment,submitInstallment,directCashEnroll,recordCashPayment,confirmPayment,
-  rejectPayment,confirmAccessPayment,rejectAccessPayment,confirmChatPayment,rejectChatPayment,
-  confirmAlkesOrder,rejectAlkesOrder,confirmDonation,rejectDonation,saveCMS,setMemberStatus,
-  functionsInstance,verifyReceipt,saveEvaluation,saveCertConfig,startEvaluation,submitEvaluation,
-  resetEvaluationSubmission,subscribeChat,reviewChatPayment,subscribeAccess,reviewAccessPayment,
-  setUserAccess,donate,reviewDonation,orderAlkes,reviewAlkesOrder,addExpense,removeExpense,freeEnroll
-};
-export default B;
