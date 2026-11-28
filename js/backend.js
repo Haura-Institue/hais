@@ -138,7 +138,13 @@ async function sync(){
 }
 setInterval(()=>{if(watchers.size&&!document.hidden&&bridge.configured)sync().catch(()=>{});},Math.max(20000,effectiveConfig.pollMs||30000));
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&watchers.size&&bridge.configured)sync().catch(()=>{});});
-function subscribe(c,filters,ok,fail,id){const w={c,filters,ok,fail,id,last:Symbol()};watchers.add(w);if(bridge.configured)queueMicrotask(()=>sync().catch(()=>{}));return()=>watchers.delete(w);}
+function subscribe(c,filters,ok,fail,id){
+  const w={c,filters,ok,fail,id,last:Symbol()};
+  watchers.add(w);
+  if(Object.keys(cache).length)queueMicrotask(()=>emit());
+  if(bridge.configured)queueMicrotask(()=>sync().catch(()=>{}));
+  return()=>watchers.delete(w);
+}
 export const watch=(c,filters,ok,fail)=>subscribe(c,filters,ok,fail);
 export async function read(c,id){
   const alias=ALIAS[c];
