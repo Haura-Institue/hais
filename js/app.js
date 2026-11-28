@@ -28,10 +28,12 @@ let state={
     certIndex:{},banners:[],subscriptionGate:{enabled:false,price:50000,durationDays:365,packageName:'Akses Portal & Modul 1 Tahun'},
     charity:{enabled:true,title:'Celengan Amal Haura Institute',description:'Dana sosial untuk kegiatan kemanusiaan, santunan, dan bakti kesehatan masyarakat.',totalCollected:0,totalDistributed:0},
     certConfig:{
+      institutionName:'HAURA INSTITUTE',subtitle:'Center of Medical Excellence',intro:'Diberikan kepada:',
       signerName:author,signerTitle:'Direktur Haura Institute',signerIdNumber:'',city:'Lombok Tengah',
       signaturePath:'',stampPath:'',defaultProgramId:'',
       bodyTemplate:'Diberikan kepada peserta yang telah menyelesaikan program dan evaluasi dengan baik:',
-      predicateRules:{minA:85,labelA:'Sangat Memuaskan',minB:75,labelB:'Memuaskan',minC:60,labelC:'Cukup',labelD:'Kurang'}
+      predicateRules:{minA:85,labelA:'Sangat Memuaskan',minB:75,labelB:'Memuaskan',minC:60,labelC:'Cukup',labelD:'Kurang'},
+      actionCodes:{}
     }
   },
   programs:[],news:[],users:[],enrollments:[],chatPayments:[],accessPayments:[],donations:[],alkes:[],alkesOrders:[],ebooks:[],certificates:[],expenses:[],messages:[],
@@ -1944,31 +1946,126 @@ function closeEbookReader(){
   }
 }
 
+function openDistributeEbookModal(ebookId){
+  adminOnly();
+  const book=state.ebooks.find(x=>x.id===ebookId);
+  if(!book)throw new Error('Data buku digital tidak ditemukan.');
+  const batches=[...new Set(state.users.map(u=>u.batch).filter(Boolean))];
+  const approvedUsers=state.users.filter(u=>u.status==='approved');
+
+  modal(`Distribusi Buku: ${esc(book.title)}`,`
+    <p style="font-size:13px;color:#475569;margin-top:0">
+      Membagikan file/tautan buku yang sudah terunggah ke banyak target sekaligus <b>tanpa unggah ulang</b>. Penerima yang sudah memiliki buku ini akan dilewati otomatis.
+    </p>
+    <form data-form="distribute-ebook">
+      <input type="hidden" name="ebookId" value="${esc(book.id)}">
+      <div class="field">
+        <label for="dist-target-type">Target Distribusi</label>
+        <select id="dist-target-type" name="targetType" required>
+          <option value="all">Semua Peserta Aktif</option>
+          <option value="batch">Berdasarkan Angkatan / Kelas</option>
+          <option value="program">Berdasarkan Program Pelatihan / UKOM / PMK</option>
+          <option value="users">Pilih Per Orang (Multi-Peserta)</option>
+        </select>
+      </div>
+
+      <div id="dist-box-batch" class="field" hidden>
+        <label for="dist-batch">Pilih Angkatan / Kelas</label>
+        <select id="dist-batch" name="batch">
+          <option value="">— Pilih Angkatan —</option>
+          ${batches.map(b=>`<option value="${esc(b)}">${esc(b)}</option>`).join('')}
+        </select>
+      </div>
+
+      <div id="dist-box-program" class="field" hidden>
+        <label for="dist-program">Pilih Program Pelatihan</label>
+        <select id="dist-program" name="programId">
+          <option value="">— Pilih Program —</option>
+          ${state.programs.map(p=>`<option value="${esc(p.id)}">${esc(p.title)}</option>`).join('')}
+        </select>
+      </div>
+
+      <div id="dist-box-users" class="field" hidden>
+        <div class="row spread" style="margin-bottom:6px">
+          <label style="margin:0">Centang Peserta Penerima (${approvedUsers.length})</label>
+          <div class="row" style="gap:6px">
+            <button type="button" class="button small" data-action="dist-select-all-users">Centang Semua</button>
+            <button type="button" class="button small ghost" data-action="dist-unselect-all-users">Batal</button>
+          </div>
+        </div>
+        <div style="max-height:200px;overflow-y:auto;border:1px solid #cbd5e1;border-radius:8px;padding:6px;background:#fff">
+          ${approvedUsers.map(u=>`
+            <label style="display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #f1f5f9;cursor:pointer;font-size:13px">
+              <input type="checkbox" class="dist-user-pick" value="${esc(u.id)}">
+              <span><b>${esc(u.fullTitleName||u.name)}</b> <small class="muted">(${esc(u.batch||'Tanpa Angkatan')})</small></span>
+            </label>
+          `).join('')||empty('Belum ada peserta aktif.')}
+        </div>
+      </div>
+
+      ${submit('Bagikan Buku Sekarang','green')}
+    </form>
+  `);
+}
+
 function renderModuleAdmin(){
+  const uniqueBooks=[];
+  const seenSources=new Set();
+  for(const b of state.ebooks){
+    const key=b.htmlPath||b.url||b.id;
+    if(!seenSources.has(key)){
+      seenSources.add(key);
+      uniqueBooks.push(b);
+    }
+  }
+
   $('#portal-content').innerHTML=`
     <h2>Distribusi Buku Digital & Edisi Fisik</h2>
-    <div class="card">
+    <div class="card" style="margin-bottom:18px">
+      <h3 style="margin-top:0">1. Unggah Buku Digital Baru</h3>
       <form data-form="module-html">
         ${field('Judul Buku Digital','title','text','','required maxlength="180"')}
         ${area('Deskripsi Singkat (opsional)','description','','maxlength="600"')}
-        <div class="field"><label for="module-user">Peserta Target</label><select id="module-user" name="userId">${userOptions(true)}</select></div>
+        <div class="field"><label for="module-user">Target Awal Publikasi</label><select id="module-user" name="userId">${userOptions(true)}</select></div>
         ${field('Harga Buku Fisik / Cetak (Rp — isi 0 jika hanya digital)','physicalPrice','number','0','required min="0" step="1000"')}
         ${field('Upload File HTML (opsional, maks 5 MB)','htmlFile','file','','accept=".html,.htm,text/html"')}
         ${area('Atau Tempel Kode HTML Buku Digital di Sini','htmlCode','','rows="8" placeholder="<!doctype html><html>...</html>"')}
         ${submit('Simpan & Publikasikan Buku','green')}
       </form>
     </div>
-    <h3 class="section-title">Daftar Buku Aktif</h3>
-    <div class="cards">${state.ebooks.map(b=>`
-      <article class="card">
+
+    ${uniqueBooks.length ? `
+      <div class="card" style="margin-bottom:18px;border-left:4px solid #087b4b">
+        <h3 style="margin-top:0">2. Bagikan Ulang Buku Terunggah (Multi-Target)</h3>
+        <p style="font-size:13px;color:#475569;margin-top:0">Pilih buku yang sudah tersimpan di server untuk dibagikan ke Semua Peserta, Angkatan, Program Pelatihan, atau Per Orang tanpa mengunggah ulang file.</p>
+        <div class="row" style="gap:8px;flex-wrap:wrap;align-items:end">
+          <div class="field" style="margin:0;flex:1;min-width:240px">
+            <label for="quick-dist-book">Pilih Buku Digital Terunggah</label>
+            <select id="quick-dist-book">
+              ${uniqueBooks.map(b=>`<option value="${esc(b.id)}">${esc(b.title)}</option>`).join('')}
+            </select>
+          </div>
+          <button type="button" class="button green" data-action="open-distribute-selected-ebook">Atur Target & Bagikan</button>
+        </div>
+      </div>
+    ` : ''}
+
+    <h3 class="section-title">Daftar Distribusi Buku Aktif (${state.ebooks.length} Entri)</h3>
+    <div class="cards">${state.ebooks.map(b=>{
+      const targetUser=state.users.find(u=>u.id===b.userId);
+      const targetLabel=b.userId==='all'
+        ? 'Semua Peserta Aktif'
+        : (targetUser ? `${targetUser.fullTitleName||targetUser.name}${targetUser.batch?` (${targetUser.batch})`:''}` : b.userId);
+      return `<article class="card">
         <b>${esc(b.title)}</b>
-        <p style="font-size:13px">${esc(b.userId==='all'?'Semua peserta':state.users.find(u=>u.id===b.userId)?.name||b.userId)}${Number(b.physicalPrice||0)>0?` · Buku Fisik: <b>${money(b.physicalPrice)}</b>`:''}</p>
+        <p style="font-size:13px">Penerima: <b>${esc(targetLabel)}</b>${Number(b.physicalPrice||0)>0?` · Buku Fisik: <b>${money(b.physicalPrice)}</b>`:''}</p>
         <div class="row" style="gap:8px;flex-wrap:wrap">
-          ${b.kind==='html'&&b.htmlPath?`<button class="button small" data-action="read-ebook" data-id="${esc(b.id)}">Pratinjau Fullscreen</button>`:''}
+          ${b.kind==='html'&&b.htmlPath?`<button class="button small" data-action="read-ebook" data-id="${esc(b.id)}">Pratinjau</button>`:''}
+          <button class="button small green" data-action="open-distribute-ebook" data-id="${esc(b.id)}">Bagikan ke Target Lain</button>
           <button class="button small danger" data-action="delete-module" data-id="${esc(b.id)}">Hapus</button>
         </div>
-      </article>
-    `).join('')||empty('Belum ada buku digital.')}</div>
+      </article>`;
+    }).join('')||empty('Belum ada buku digital.')}</div>
   `;
 }
 
@@ -2463,16 +2560,35 @@ function renderMemberCertificates(force=false){
   root.innerHTML=`<h2>Sertifikat Profesional</h2><div class="stack">${html}</div>`;
 }
 
-function nextAutoSerial(offset=0){
+function getActionCertPrefix(programId=''){
   const year=new Date().getFullYear();
-  let maxNum=0;
+  const cfg=state.cms?.certConfig||{};
+  const ac=(cfg.actionCodes && programId) ? cfg.actionCodes[programId] : null;
+  const rawCode=String(ac?.code||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'');
+  return rawCode ? `HI/${rawCode}/${year}/` : `HI/${year}/`;
+}
+
+function nextAutoSerial(offset=0, programId=''){
+  const prefix=getActionCertPrefix(programId);
+  const cfg=state.cms?.certConfig||{};
+  const ac=(cfg.actionCodes && programId) ? cfg.actionCodes[programId] : null;
+  let maxNum=Number(ac?.lastSeq||0);
   for(const c of state.certificates){
-    const m=String(c.serial||'').match(/(\d+)\s*$/);
-    if(m)maxNum=Math.max(maxNum,Number(m[1]));
+    const s=String(c.serial||'').trim();
+    if(s.startsWith(prefix)){
+      const m=s.slice(prefix.length).match(/^(\d+)/);
+      if(m)maxNum=Math.max(maxNum,Number(m[1]));
+    }
   }
-  const idxCount=Object.keys(state.cms?.certIndex||{}).length;
-  const base=Math.max(maxNum,idxCount,state.certificates.length)+1+offset;
-  return `HI/${year}/${String(base).padStart(4,'0')}`;
+  for(const rec of Object.values(state.cms?.certIndex||{})){
+    const s=String(rec?.serial||'').trim();
+    if(s.startsWith(prefix)){
+      const m=s.slice(prefix.length).match(/^(\d+)/);
+      if(m)maxNum=Math.max(maxNum,Number(m[1]));
+    }
+  }
+  const base=maxNum+1+offset;
+  return `${prefix}${String(base).padStart(4,'0')}`;
 }
 
 function renderCertificateEditor(){
@@ -2486,11 +2602,16 @@ function renderCertificateEditor(){
   });
 
   const cfg=state.cms?.certConfig||{};
+  const actionCodes=cfg.actionCodes||{};
   const rules=getPredicateRules();
   const selectedProgId=(certFilterProg!=='ALL'?certFilterProg:'') || cfg.defaultProgramId || state.programs[0]?.id || '';
+  const yearNow=new Date().getFullYear();
 
   const progSelectOpts=`<option value="">— Pilih Pelatihan Tersedia —</option>`+
-    state.programs.map(p=>`<option value="${esc(p.id)}" ${selectedProgId===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
+    state.programs.map(p=>{
+      const cCode=actionCodes[p.id]?.code ? ` [${actionCodes[p.id].code}]` : '';
+      return `<option value="${esc(p.id)}" ${selectedProgId===p.id?'selected':''}>${esc(p.title)}${esc(cCode)}</option>`;
+    }).join('');
   const progFilterOpts=`<option value="ALL">Semua Program</option>`+
     state.programs.map(p=>`<option value="${esc(p.id)}" ${certFilterProg===p.id?'selected':''}>${esc(p.title)}</option>`).join('');
   const batchOpts=`<option value="ALL">Semua Angkatan / Kelas</option>`+
@@ -2522,19 +2643,24 @@ function renderCertificateEditor(){
   });
 
   $('#portal-content').innerHTML=`
-    <h2>Generator & Cetak Sertifikat (Konfigurasi TTD & Predikat Otomatis)</h2>
+    <h2>Generator & Cetak Sertifikat (Konfigurasi Terpadu & Multi-Kode Tindakan)</h2>
 
     <details class="card" style="margin-bottom:16px">
-      <summary style="font-weight:700;cursor:pointer">Simpan Konfigurasi Sertifikat (Penandatangan, TTD, Stempel & Aturan Predikat)</summary>
+      <summary style="font-weight:700;cursor:pointer">Konfigurasi Sertifikat Terpadu (Institusi, Penandatangan, TTD, Stempel, Multi-Kode & Predikat)</summary>
       <form data-form="save-cert-config" style="margin-top:12px">
+        <div class="grid">
+          ${field('Nama Institusi Tersimpan','institutionName','text',cfg.institutionName||'HAURA INSTITUTE','maxlength="120"')}
+          ${field('Subjudul Institusi Tersimpan','subtitle','text',cfg.subtitle||'Center of Medical Excellence','maxlength="120"')}
+        </div>
+        <div class="grid">
+          ${field('Kalimat Pembuka Default','intro','text',cfg.intro||'Diberikan kepada:','maxlength="150"')}
+          ${field('Kota Penerbitan Default','city','text',cfg.city||'Lombok Tengah','maxlength="100"')}
+        </div>
         <div class="grid">
           ${field('Nama Penandatangan Tersimpan','signerName','text',cfg.signerName||author,'maxlength="160"')}
           ${field('Jabatan Penandatangan Tersimpan','signerTitle','text',cfg.signerTitle||'Direktur Haura Institute','maxlength="160"')}
         </div>
-        <div class="grid">
-          ${field('NIP / NIRA / No. Induk Penandatangan','signerIdNumber','text',cfg.signerIdNumber||'','maxlength="100"')}
-          ${field('Kota Penerbitan Default','city','text',cfg.city||'Lombok Tengah','maxlength="100"')}
-        </div>
+        ${field('NIP / NIRA / No. Induk Penandatangan','signerIdNumber','text',cfg.signerIdNumber||'','maxlength="100"')}
         <div class="grid">
           <div class="field">
             <label for="cfg-sign-file">Upload Gambar Tanda Tangan (TTD) Tersimpan</label>
@@ -2552,6 +2678,24 @@ function renderCertificateEditor(){
           </div>
         </div>
         ${area('Redaksi Default Sertifikat (Tetap Bisa Diedit Manual di Form)','bodyTemplate',cfg.bodyTemplate||'Diberikan kepada peserta yang telah menyelesaikan program dan evaluasi dengan baik:','maxlength="3000"')}
+
+        <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:10px;padding:12px;margin:12px 0">
+          <b>Multi-Kode Nomor Sertifikat per Tindakan / Pelatihan</b>
+          <p class="muted" style="font-size:12.5px;margin:4px 0 10px">Isi kode singkat tindakan (misal: <b>WC</b> untuk Wound Care, <b>SUT</b> untuk Suturing, <b>IV</b> untuk Infus). Setiap tindakan memiliki nomor urut mandiri (contoh: <code>HI/WC/${yearNow}/0001</code>).</p>
+          ${state.programs.length ? state.programs.map(p=>{
+            const ac=actionCodes[p.id]||{};
+            const codeVal=ac.code||'';
+            const previewFmt=codeVal ? `HI/${codeVal}/${yearNow}/0001` : `HI/${yearNow}/0001`;
+            return `<div class="row spread" style="gap:8px;padding:6px 0;border-bottom:1px dashed #e2e8f0;flex-wrap:wrap">
+              <div style="flex:1;min-width:200px">
+                <b style="font-size:13px">${esc(p.title)}</b><br>
+                <small class="muted">Format: <code>${esc(previewFmt)}</code> (Urut terakhir: ${Number(ac.lastSeq||0)})</small>
+              </div>
+              <input type="text" name="actionCode_${esc(p.id)}" value="${esc(codeVal)}" maxlength="16" placeholder="Kode (mis. WC)" style="width:140px;text-transform:uppercase">
+            </div>`;
+          }).join('') : '<small class="muted">Belum ada program/tindakan terdaftar.</small>'}
+        </div>
+
         <div class="grid">
           ${field('Ambang Predikat Tertinggi (Nilai >=)','minA','number',String(rules.minA),'min="0" max="100" step="1"')}
           ${field('Label Predikat Tertinggi','labelA','text',rules.labelA,'maxlength="60"')}
@@ -2585,13 +2729,19 @@ function renderCertificateEditor(){
 
     <div class="cert-grid">
       <form id="certificate-form" data-form="publish-cert-batch" class="card">
-        ${field('Nomor Sertifikat Awal (Otomatis Berurutan)','serial','text',nextAutoSerial(0),'required maxlength="80"')}
-        ${field('Nama Institusi','heading','text','HAURA INSTITUTE','required maxlength="80"')}
-        ${field('Subjudul','subtitle','text','Center of Medical Excellence','maxlength="100"')}
-        ${field('Kalimat Pembuka','intro','text','Diberikan kepada:','maxlength="150"')}
+        <div class="field">
+          <label for="serial">Nomor Sertifikat Awal (Multi-Kode Tindakan)</label>
+          <div class="row" style="gap:6px">
+            <input id="serial" name="serial" type="text" value="${esc(nextAutoSerial(0,selectedProgId))}" required maxlength="80" style="flex:1">
+            <button type="button" class="button small" data-action="fetch-next-serial">Sinkron No. Server</button>
+          </div>
+        </div>
+        ${field('Nama Institusi','heading','text',cfg.institutionName||'HAURA INSTITUTE','required maxlength="80"')}
+        ${field('Subjudul','subtitle','text',cfg.subtitle||'Center of Medical Excellence','maxlength="100"')}
+        ${field('Kalimat Pembuka','intro','text',cfg.intro||'Diberikan kepada:','maxlength="150"')}
         ${field('Redaksi / Isi Teks Sertifikat (Dapat Diubah Manual)','body','text',cfg.bodyTemplate||'Atas partisipasinya dalam program pelatihan:','maxlength="300"')}
         <div class="field">
-          <label for="cert-program-select">Pilihan Pelatihan Tersedia</label>
+          <label for="cert-program-select">Pilihan Pelatihan / Tindakan</label>
           <select id="cert-program-select" name="programSelectId">${progSelectOpts}</select>
         </div>
         ${field('Judul Pelatihan di Sertifikat (Opsional — Timpa Teks Pilihan Pelatihan)','course','text','','maxlength="150" placeholder="Kosongkan untuk memakai nama pelatihan terpilih"')}
@@ -2672,6 +2822,7 @@ function resolveCertificateCourseTitle(c, enr, prog){
 function updateCertificate(overrideEnr=null, overrideSerial=null){
   const el=$('#certificate-preview');if(!el)return;
   const c=certificateData();
+  const cfg=state.cms?.certConfig||{};
   const checkedEl=document.querySelector('.cert-pick:checked');
   const enr=overrideEnr||(checkedEl?state.enrollments.find(e=>e.id===checkedEl.value):null);
   const u=enr?state.users.find(x=>x.id===enr.userId):null;
@@ -2682,35 +2833,39 @@ function updateCertificate(overrideEnr=null, overrideSerial=null){
   const predInput=$('#pred');
   if(predInput && !overrideEnr)predInput.value=predicateLabel;
 
-  const serial=overrideSerial||c.serial||nextAutoSerial(0);
+  const activeProgId=enr?.programId || c.programSelectId || '';
+  const serial=overrideSerial||c.serial||nextAutoSerial(0,activeProgId);
   const qrDataUrl=makeQrDataUrl(certVerifyURL(serial));
   const issuedFmt=c.issued?new Date(c.issued+'T12:00:00').toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'}):'';
+  const signerIdHtml=cfg.signerIdNumber ? `<small style="display:block;font-size:9px;color:#475569">${esc(cfg.signerIdNumber)}</small>` : '';
 
-  const sign=(key,name,title)=>`<div>${certImages[key]?`<img src="${esc(certImages[key])}" alt="Tanda tangan">`:'<div class="signature-space"></div>'}<b>${esc(name||'________________________')}</b><span>${esc(title)}</span></div>`;
+  const sign=(key,name,title,extraHtml='',stampHtml='')=>`<div style="position:relative">${stampHtml}${certImages[key]?`<img src="${esc(certImages[key])}" alt="Tanda tangan">`:'<div class="signature-space"></div>'}<b>${esc(name||'________________________')}</b><span>${esc(title)}</span>${extraHtml}</div>`;
+  const stampTag=certImages.stamp ? `<img src="${esc(certImages.stamp)}" alt="Stempel" style="position:absolute;left:-18px;top:-6px;width:68px;height:68px;object-fit:contain;opacity:.82;pointer-events:none">` : '';
+
   el.innerHTML=`
     <div>
       <div class="cert-logos"><img src="${esc(certImages.main)}" alt="Logo">${certImages.partner?`<img src="${esc(certImages.partner)}" alt="Mitra">`:''}</div>
-      <h2>${esc(c.heading||'HAURA INSTITUTE')}</h2>
-      <span class="cert-sub">${esc(c.subtitle||'Center of Medical Excellence')}</span>
+      <h2>${esc(c.heading||cfg.institutionName||'HAURA INSTITUTE')}</h2>
+      <span class="cert-sub">${esc(c.subtitle||cfg.subtitle||'Center of Medical Excellence')}</span>
     </div>
     <div>
-      <p>${esc(c.intro||'Diberikan kepada:')}</p>
+      <p>${esc(c.intro||cfg.intro||'Diberikan kepada:')}</p>
       <h3>${esc(u?.fullTitleName||u?.name||'Nama Peserta')}</h3>
       <p>${esc(u?.institution||'Instansi Peserta')}</p>
-      <p>${esc(c.body||'Atas partisipasinya dalam program pelatihan:')}</p>
+      <p>${esc(c.body||cfg.bodyTemplate||'Atas partisipasinya dalam program pelatihan:')}</p>
       <div class="cert-course">${esc(courseName)}</div>
       <div class="cert-predicate">Predikat: ${esc(predicateLabel)}${scoreInfo.score!==null?` (Nilai: ${esc(scoreInfo.score)})`:''}</div>
     </div>
     <div style="width:100%">
-      <p>${esc(c.place||'Lombok Tengah')}, ${esc(issuedFmt)}</p>
+      <p>${esc(c.place||cfg.city||'Lombok Tengah')}, ${esc(issuedFmt)}</p>
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px">
         <div style="text-align:center;min-width:96px">
           <img src="${qrDataUrl}" alt="QR Verifikasi" style="width:76px;height:76px;border:1px solid #cbd5e1;padding:3px;background:#fff;border-radius:6px">
           <div style="font-size:8.5px;color:#475569;margin-top:2px">Scan Verifikasi</div>
         </div>
-        <div class="cert-signatures" style="flex:1">${sign('left',c.leftName,c.leftTitle)}${sign('right',c.rightName,c.rightTitle)}</div>
+        <div class="cert-signatures" style="flex:1">${sign('left',c.leftName,c.leftTitle)}${sign('right',c.rightName,c.rightTitle,signerIdHtml,stampTag)}</div>
       </div>
-      <p class="cert-meta">No. ${esc(serial)} · Haura Institute</p>
+      <p class="cert-meta">No. ${esc(serial)} · ${esc(c.heading||cfg.institutionName||'Haura Institute')}</p>
     </div>
   `;
 }
@@ -3839,7 +3994,38 @@ async function doAction(action,el){
   if(action==='delete-expense'){adminOnly();await B.remove('expenses',el.dataset.id);return toast('Pengeluaran dihapus.');}
 
   if(action==='approve-user'||action==='reject-user'){adminOnly();await B.setMemberStatus(el.dataset.id,action==='approve-user'?'approved':'rejected');return toast('Status peserta diperbarui.');}
-  if(action==='delete-module'){adminOnly();const b=state.ebooks.find(x=>x.id===el.dataset.id);await B.remove('ebooks',el.dataset.id);if(b?.htmlPath)await B.removeFile(b.htmlPath).catch(()=>{});return toast('Buku dihapus.');}
+  if(action==='delete-module'){
+    adminOnly();
+    const b=state.ebooks.find(x=>x.id===el.dataset.id);
+    await B.remove('ebooks',el.dataset.id);
+    const stillUsed=b?.htmlPath && state.ebooks.some(x=>x.id!==b.id && x.htmlPath===b.htmlPath);
+    if(b?.htmlPath && !stillUsed)await B.removeFile(b.htmlPath).catch(()=>{});
+    renderModuleAdmin();
+    return toast('Entri buku dihapus.');
+  }
+  if(action==='open-distribute-ebook'){return openDistributeEbookModal(el.dataset.id);}
+  if(action==='open-distribute-selected-ebook'){
+    const selId=$('#quick-dist-book')?.value;
+    if(!selId)throw new Error('Pilih buku terlebih dahulu.');
+    return openDistributeEbookModal(selId);
+  }
+  if(action==='dist-select-all-users'){document.querySelectorAll('.dist-user-pick').forEach(cb=>cb.checked=true);return;}
+  if(action==='dist-unselect-all-users'){document.querySelectorAll('.dist-user-pick').forEach(cb=>cb.checked=false);return;}
+  if(action==='fetch-next-serial'){
+    adminOnly();
+    const progId=$('#cert-program-select')?.value||'';
+    const ac=(state.cms?.certConfig?.actionCodes && progId)?state.cms.certConfig.actionCodes[progId]:null;
+    const prefix=getActionCertPrefix(progId);
+    if(B?.nextCertSerial){
+      const res=await B.nextCertSerial({programId:progId,code:ac?.code||'',prefix,previewOnly:true});
+      const srvSerial=typeof res==='string'?res:(res?.serial||nextAutoSerial(0,progId));
+      if($('#serial'))$('#serial').value=srvSerial;
+    }else if($('#serial')){
+      $('#serial').value=nextAutoSerial(0,progId);
+    }
+    updateCertificate();
+    return toast('Nomor sertifikat disinkronkan dengan server.');
+  }
   if(action==='edit-program'){adminOnly();const p=state.programs.find(x=>x.id===el.dataset.id);return modal('Edit Program',`<form data-form="edit-program" data-id="${esc(p.id)}">${field('Nama Program','title','text',p.title,'required maxlength="180"')}${area('Deskripsi','description',p.description,'required maxlength="3000"')}${field('Total Biaya (Rp)','totalFee','number',String(HauraFinance.programFee(p)),'required min="1000" step="1000"')}${field('Minimal Bayar / DP (Rp)','minDownPayment','number',String(HauraFinance.programMinDp(p)),'required min="0" step="1000"')}${submit('Simpan')}</form>`);}
   if(action==='archive-program'){adminOnly();await B.patch('programs',el.dataset.id,{archived:true});return toast('Program diarsipkan.');}
   if(action==='archive-news'){adminOnly();await B.patch('news',el.dataset.id,{archived:true});return toast('Berita diarsipkan.');}
@@ -4392,7 +4578,7 @@ async function submitForm(form,data){
     return toast('Pesanan PO Baju Kesehatan terkirim.');
   }
 
-  if(kind==='save-cert-config'){
+if(kind==='save-cert-config'){
     adminOnly();
     const prevCfg=state.cms?.certConfig||{};
     let signaturePath=prevCfg.signaturePath||'';
@@ -4411,8 +4597,25 @@ async function submitForm(form,data){
       stampPath=up.path;
       certImages.stamp=await B.fileURL(up.path).catch(()=>certImages.stamp);
     }
+
+    const prevActionCodes=prevCfg.actionCodes||{};
+    const nextActionCodes={};
+    for(const p of state.programs){
+      const raw=String(data.get('actionCode_'+p.id)||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'');
+      if(raw){
+        nextActionCodes[p.id]={
+          code:raw,
+          programTitle:p.title||'',
+          lastSeq:Number(prevActionCodes[p.id]?.lastSeq||0)
+        };
+      }
+    }
+
     const nextCfg={
       ...prevCfg,
+      institutionName:String(data.get('institutionName')||'HAURA INSTITUTE').trim(),
+      subtitle:String(data.get('subtitle')||'Center of Medical Excellence').trim(),
+      intro:String(data.get('intro')||'Diberikan kepada:').trim(),
       signerName:String(data.get('signerName')||author).trim(),
       signerTitle:String(data.get('signerTitle')||'Direktur Haura Institute').trim(),
       signerIdNumber:String(data.get('signerIdNumber')||'').trim(),
@@ -4420,6 +4623,7 @@ async function submitForm(form,data){
       bodyTemplate:String(data.get('bodyTemplate')||'').trim(),
       signaturePath,
       stampPath,
+      actionCodes:nextActionCodes,
       predicateRules:{
         minA:Number(data.get('minA')??85),
         labelA:String(data.get('labelA')||'Sangat Memuaskan').trim()||'Sangat Memuaskan',
@@ -4432,7 +4636,7 @@ async function submitForm(form,data){
     };
     await B.saveCMS({...state.cms,certConfig:nextCfg});
     renderCertificateEditor();
-    return toast('Konfigurasi TTD, stempel & aturan predikat tersimpan.');
+    return toast('Konfigurasi sertifikat terpadu & multi-kode tindakan tersimpan.');
   }
 
   if(kind==='publish-cert-batch'){
@@ -4443,12 +4647,8 @@ async function submitForm(form,data){
     const {jsPDF}=await import('../vendor/pdf.js');
     const pdf=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
     let pageIdx=0;
-    const startSerialMatch=String(c.serial||'').match(/^(.*?)(\d+)\s*$/);
-    const prefix=startSerialMatch?startSerialMatch[1]:'HI/2026/';
-    const startNum=startSerialMatch?Number(startSerialMatch[2]):1;
-    const padLen=startSerialMatch?startSerialMatch[2].length:4;
 
-    toast(`Menerbitkan & mencetak ${pickedIds.length} sertifikat…`);
+    toast(`Menerbitkan & mencetak ${pickedIds.length} sertifikat dengan penguncian nomor server…`);
     for(let i=0;i<pickedIds.length;i++){
       const enr=state.enrollments.find(e=>e.id===pickedIds[i]);
       if(!enr)continue;
@@ -4457,7 +4657,21 @@ async function submitForm(form,data){
       const courseName=resolveCertificateCourseTitle(c, enr, prog);
       const scInfo=resolveParticipantScoreAndPredicate(enr);
       const autoPredicate=scInfo.predicate || computeAutoPredicate(scInfo.score) || 'Memuaskan';
-      const serial=i===0 && c.serial ? String(c.serial).trim() : `${prefix}${String(startNum+i).padStart(padLen,'0')}`;
+      const targetProgId=enr.programId || c.programSelectId || '';
+      const ac=(state.cms?.certConfig?.actionCodes && targetProgId) ? state.cms.certConfig.actionCodes[targetProgId] : null;
+      const autoPrefix=getActionCertPrefix(targetProgId);
+
+      let serial='';
+      if(B?.nextCertSerial){
+        const seqRes=await B.nextCertSerial({
+          programId:targetProgId,
+          code:ac?.code||'',
+          prefix:autoPrefix
+        });
+        serial=typeof seqRes==='string' ? seqRes : (seqRes?.serial || seqRes?.serials?.[0] || nextAutoSerial(i, targetProgId));
+      }else{
+        serial=nextAutoSerial(i, targetProgId);
+      }
 
       updateCertificate(enr, serial);
       const canvas=await captureCertificate();
@@ -4465,7 +4679,7 @@ async function submitForm(form,data){
       await B.add('certificates',{
         userId:enr.userId,
         enrollmentId:enr.id,
-        programId:enr.programId,
+        programId:targetProgId,
         title:courseName,
         serial,
         score:scInfo.score,
@@ -4493,8 +4707,30 @@ async function submitForm(form,data){
       pageIdx++;
     }
     if(pageIdx>0)pdf.save(`Sertifikat_${new Date().toISOString().slice(0,10)}.pdf`);
+    if($('#serial'))$('#serial').value=nextAutoSerial(0, c.programSelectId||'');
     updateCertificate();
     return toast(`${pageIdx} sertifikat berhasil diterbitkan & diunduh.`);
+  }
+
+  if(kind==='distribute-ebook'){
+    adminOnly();
+    const ebookId=String(data.get('ebookId')||'').trim();
+    const targetType=String(data.get('targetType')||'all').trim();
+    const batch=String(data.get('batch')||'').trim();
+    const programId=String(data.get('programId')||'').trim();
+    const userIds=[...document.querySelectorAll('.dist-user-pick:checked')].map(cb=>cb.value);
+
+    if(!ebookId)throw new Error('Pilih buku digital yang akan didistribusikan.');
+    if(targetType==='batch' && !batch)throw new Error('Pilih angkatan / kelas target.');
+    if(targetType==='program' && !programId)throw new Error('Pilih program pelatihan target.');
+    if(targetType==='users' && !userIds.length)throw new Error('Centang minimal satu peserta target.');
+
+    const res=await B.distributeEbook({ebookId,targetType,batch,programId,userIds});
+    close();
+    renderModuleAdmin();
+    const added=Number(res?.distributedCount ?? res?.addedCount ?? res?.created ?? 0);
+    const skipped=Number(res?.skippedCount ?? res?.skipped ?? 0);
+    return toast(`Buku berhasil dibagikan: ${added} penerima baru${skipped>0?`, ${skipped} penerima ganda dilewati otomatis`:''}.`);
   }
 
   if(kind==='paid-enroll'){
@@ -4832,7 +5068,19 @@ document.addEventListener('change',async event=>{
     if(cntEl)cntEl.textContent=String(ansCount);
     return;
   }
-
+if(event.target.id==='dist-target-type'){
+    const val=event.target.value;
+    if($('#dist-box-batch'))$('#dist-box-batch').hidden=(val!=='batch');
+    if($('#dist-box-program'))$('#dist-box-program').hidden=(val!=='program');
+    if($('#dist-box-users'))$('#dist-box-users').hidden=(val!=='users');
+    return;
+  }
+  if(event.target.id==='cert-program-select'){
+    const progId=event.target.value||'';
+    if($('#serial'))$('#serial').value=nextAutoSerial(0,progId);
+    updateCertificate();
+    return;
+  }
   if(event.target.id==='eval-filter-prog'){evalFilterProg=event.target.value;renderEvaluationsAdmin();return;}
   if(event.target.id==='eval-filter-batch'){evalFilterBatch=event.target.value;renderEvaluationsAdmin();return;}
   if(event.target.id==='finance-filter'){financeFilterProgram=event.target.value;renderFinanceAdmin(true);hydrate();return;}
