@@ -1,4 +1,4 @@
-/* HAURA v3.6 — JEMBATAN DATA (GitHub Pages <-> Google Apps Script + Drive) */
+/* HAURA v3.7 — JEMBATAN DATA (GitHub Pages <-> Google Apps Script + Drive) */
 import {driveConfig} from './drive-config.js';
 import {createBridge,revive,selectRows} from './drive-client.js';
 
@@ -563,6 +563,14 @@ export async function saveCertConfig(payload){
   if(args.certConfig)args.certConfig=mapCertConfig(args.certConfig);
   return runAndSync('saveCertConfig',args);
 }
+export async function nextCertSerial(payload){
+  const args=typeof payload==='string'?{actionCodeId:payload,commit:false}:(payload||{});
+  if(args.commit)return runAndSync('nextCertSerial',args);
+  return bridge.call('nextCertSerial',args);
+}
+export async function distributeEbook(payload){
+  return runAndSync('distributeEbook',payload||{});
+}
 export async function startEvaluation(payload){
   const args=typeof payload==='string'?{evaluationId:payload}:payload;
   const result=await runAndSync('startEvaluation',args);
@@ -596,8 +604,9 @@ export const B={
   submitPaidEnrollment,submitInstallment,directCashEnroll,recordCashPayment,confirmPayment,
   rejectPayment,confirmAccessPayment,rejectAccessPayment,confirmChatPayment,rejectChatPayment,
   confirmAlkesOrder,rejectAlkesOrder,confirmDonation,rejectDonation,saveCMS,setMemberStatus,
-  functionsInstance,verifyReceipt,saveEvaluation,saveCertConfig,startEvaluation,submitEvaluation,
-  resetEvaluationSubmission,subscribeChat,reviewChatPayment,subscribeAccess,reviewAccessPayment,
-  setUserAccess,donate,reviewDonation,orderAlkes,reviewAlkesOrder,addExpense,removeExpense,freeEnroll
+  functionsInstance,verifyReceipt,saveEvaluation,saveCertConfig,nextCertSerial,distributeEbook,
+  startEvaluation,submitEvaluation,resetEvaluationSubmission,subscribeChat,reviewChatPayment,
+  subscribeAccess,reviewAccessPayment,setUserAccess,donate,reviewDonation,orderAlkes,reviewAlkesOrder,
+  addExpense,removeExpense,freeEnroll
 };
 export default B;
